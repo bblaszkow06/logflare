@@ -23,6 +23,7 @@ defmodule Logflare.Backends.Backend do
     loki: Adaptor.LokiAdaptor,
     clickhouse: Adaptor.ClickhouseAdaptor,
     incidentio: Adaptor.IncidentioAdaptor,
+    otel: Adaptor.OpenTelemetryAdaptor,
     s3: Adaptor.S3Adaptor
   }
 
