@@ -14,9 +14,10 @@ defmodule Logflare.Backends.Adaptor.AxiomAdaptor do
   """
 
   alias Logflare.Backends.Adaptor
-  alias Logflare.Backends.Adaptor.WebhookAdaptor
+  alias Logflare.Backends.Adaptor.HttpBased
 
   @behaviour Adaptor
+  @behaviour HttpBased.Client
 
   def child_spec(init_arg) do
     %{
@@ -25,47 +26,55 @@ defmodule Logflare.Backends.Adaptor.AxiomAdaptor do
     }
   end
 
-  @impl Adaptor
-  def start_link({source, backend}) do
-    backend = %{backend | config: transform_config(backend)}
-    WebhookAdaptor.start_link({source, backend})
-  end
-
-  @impl Adaptor
-  def format_batch(log_events) do
-    for %{body: body} <- log_events do
-      Map.update!(body, "timestamp", fn timestamp ->
-        timestamp
-        |> DateTime.from_unix!(:microsecond)
-        |> DateTime.to_iso8601()
-      end)
-    end
-  end
-
-  @impl Adaptor
-  def transform_config(%{config: config}) do
-    # Endpoint docs: https://axiom.co/docs/restapi/endpoints/ingestIntoDataset
-    query = %{
-      "timestamp-field" => "timestamp",
-      "timestamp-format" => "2006-01-02T15:04:05.999999Z07:00"
-    }
-
+  @impl HttpBased.Client
+  def client(config) do
     url =
       config
       |> dataset_uri()
-      |> URI.append_query(URI.encode_query(query))
       |> URI.to_string()
 
-    %{
-      url: url,
-      headers: %{
-        "content-type" => "application/json",
-        "authorization" => "Bearer #{config.api_token}"
-      },
-      http: "http2",
-      gzip: true,
-      format_batch: &format_batch/1
-    }
+    query = [
+      {"timestamp-field", "timestamp"},
+      {"timestamp-format", "2006-01-02T15:04:05.999999Z07:00"}
+    ]
+
+    Tesla.client(
+      [
+        Tesla.Middleware.Telemetry,
+        {Tesla.Middleware.BaseUrl, url},
+        {Tesla.Middleware.Query, query},
+        {Tesla.Middleware.BearerAuth, token: config.api_token},
+        __MODULE__.LogEventFormatter,
+        Tesla.Middleware.JSON,
+        {Tesla.Middleware.CompressRequest, format: "gzip"},
+        HttpBased.EgressTracer
+      ],
+      Client.adapter_config("http2")
+    )
+  end
+
+  @impl Adaptor
+  def start_link({source, backend}) do
+    HttpBased.Pipeline.start_link(source, backend, __MODULE__)
+  end
+
+  defmodule LogEventFormatter do
+    @behaviour Tesla.Middleware
+
+    @impl true
+    def call(env, next, _opts) do
+      # TODO: check if list of LogEvent
+      logs =
+        for %{body: body} <- env.body do
+          Map.update!(body, "timestamp", fn timestamp ->
+            timestamp
+            |> DateTime.from_unix!(:microsecond)
+            |> DateTime.to_iso8601()
+          end)
+        end
+
+      Tesla.run(%{env | body: logs}, next)
+    end
   end
 
   @impl Adaptor
@@ -106,19 +115,10 @@ defmodule Logflare.Backends.Adaptor.AxiomAdaptor do
   end
 
   def test_connection(%{config: config}) do
-    url = config |> dataset_uri() |> URI.to_string()
-
     result =
-      Tesla.client(
-        [
-          {Tesla.Middleware.BearerAuth, token: config.api_token},
-          Tesla.Middleware.JSON,
-          {Tesla.Middleware.CompressRequest, format: "gzip"},
-          Tesla.Middleware.Telemetry
-        ],
-        {Tesla.Adapter.Finch, name: Logflare.FinchDefault, receive_timeout: 5_000}
-      )
-      |> Tesla.post(url, [])
+      config
+      |> client()
+      |> Tesla.post("", [])
 
     case result do
       {:ok, %Tesla.Env{status: 200}} -> :ok

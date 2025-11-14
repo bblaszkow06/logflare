@@ -1,12 +1,16 @@
-defmodule Logflare.Backends.Adaptor.WebhookAdaptor.EgressMiddleware do
-  @moduledoc false
+defmodule Logflare.Backends.Adaptor.HttpBased.EgressTracer do
+  @moduledoc """
+  Tesla middleware tracing the egress.
+
+  Should be used as last middleware called before the `Tesla.Adapter`
+  """
 
   require OpenTelemetry.Tracer
 
   @behaviour Tesla.Middleware
 
   @impl true
-  def call(env, next, options) do
+  def call(env, next, _options) do
     body_len =
       if is_binary(env.body) do
         IO.iodata_length(env.body)
@@ -23,8 +27,9 @@ defmodule Logflare.Backends.Adaptor.WebhookAdaptor.EgressMiddleware do
           acc
       end
 
+    # TODO: determine whether env.opts or options should be here
     meta_kw =
-      for {k, v} <- Keyword.get(options, :metadata) || %{},
+      for {k, v} <- Keyword.get(env.opts, :metadata) || %{},
           v != nil do
         {k, v}
       end
