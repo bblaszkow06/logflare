@@ -32,7 +32,7 @@
   </div>
 
   <div :if={@live_action == :new}>
-    {select(f, :type, ["Select a backend type...", Webhook: :webhook, Postgres: :postgres, BigQuery: :bigquery, Datadog: :datadog, Elastic: :elastic, Loki: :loki, ClickHouse: :clickhouse, "Incident.io": :incidentio, S3: :s3, Axiom: :axiom],
+    {select(f, :type, ["Select a backend type...", Webhook: :webhook, Postgres: :postgres, BigQuery: :bigquery, Datadog: :datadog, Elastic: :elastic, Loki: :loki, ClickHouse: :clickhouse, "Incident.io": :incidentio, S3: :s3, Axiom: :axiom, OTLP: :otlp],
       phx_change: :change_form_type,
       class: "form-control form-control-margin",
       id: "type"
@@ -327,6 +327,14 @@
             {text_input(f_config, :domain, class: "form-control", value: "api.axiom.co")}
             <small class="form-text text-muted">
               The regionalized Axiom domain, defaults to the domain for the US region
+            </small>
+          </div>
+        <% "otlp" -> %>
+          <div class="form-group">
+            {label(f_config, :endpoint, "Endpoint")}
+            {text_input(f_config, :endpoint, class: "form-control")}
+            <small class="form-text text-muted">
+              Address of the OTLP Endpoint
             </small>
           </div>
         <% _ -> %>

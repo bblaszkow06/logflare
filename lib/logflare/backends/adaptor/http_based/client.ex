@@ -24,13 +24,23 @@ defmodule Logflare.Backends.Adaptor.HttpBased.Client do
                {:url, binary()}
                | {:query, Tesla.Env.query()}
                | {:token, binary()}
-               | {:gzip, true}
-               | {:headers, Tesla.Env.headers()}
+               | {:gzip, boolean()}
+               | {:json, boolean()}
+               | {:headers, %{string() => string()} | Tesla.Env.headers()}
                | {:basic_auth, [username: binary(), password: binary()]}
                | {:formatter, Tesla.Client.middleware()}
                | {:pool_name, atom()}
                | {:http2, boolean()}
   def new(opts \\ []) do
+    headers_middleware =
+      case opts[:headers] do
+        nil -> nil
+        [] -> nil
+        [_ | _] = headers -> {Tesla.Middleware.Headers, headers}
+        %{} = map when map_size(map) == 0 -> nil
+        %{} = headers -> {Tesla.Middleware.Headers, Enum.to_list(headers)}
+      end
+
     Tesla.client(
       [
         Tesla.Middleware.Telemetry,
@@ -38,14 +48,14 @@ defmodule Logflare.Backends.Adaptor.HttpBased.Client do
         opts[:query] && {Tesla.Middleware.Query, opts[:query]},
         opts[:token] && {Tesla.Middleware.BearerAuth, token: opts[:token]},
         opts[:basic_auth] && {Tesla.Middleware.BasicAuth, opts[:basic_auth]},
-        opts[:headers] && {Tesla.Middleware.Headers, opts[:headers]},
-        Access.get(opts, :formatter, LogEventTransformer),
-        Tesla.Middleware.JSON,
+        headers_middleware,
+        Keyword.get(opts, :formatter, LogEventTransformer),
+        Keyword.get(opts, :json, true) && Tesla.Middleware.JSON,
         opts[:gzip] && {Tesla.Middleware.CompressRequest, format: "gzip"},
         EgressTracer
       ]
       |> Enum.filter(& &1),
-      adapter_config(Access.get(opts, :http2, true), opts[:pool_name])
+      adapter_config(Keyword.get(opts, :http2, true), opts[:pool_name])
     )
   end
 
