@@ -689,7 +689,7 @@ defmodule Logflare.BackendsTest do
         _ -> false
       end)
 
-      Backends.clear_list_backends_cache(source.id)
+      Backends.Cache.clear_list_backends(source.id)
 
       start_supervised!({SourceSup, source})
       :timer.sleep(500)
@@ -995,7 +995,7 @@ defmodule Logflare.BackendsTest do
         _ -> false
       end)
 
-      Backends.clear_list_backends_cache(source.id)
+      Backends.Cache.clear_list_backends(source.id)
 
       IngestEventQueue.upsert_tid({:consolidated, backend.id, nil})
       IngestEventQueue.upsert_tid({source.id, nil, nil})

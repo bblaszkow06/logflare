@@ -361,7 +361,7 @@ defmodule Logflare.Backends do
         [{Logflare.Sources, source.id}] ++ Enum.map(backend_ids, &{Logflare.Backends, &1})
 
       ContextCache.bust_keys(cache_keys)
-      clear_list_backends_cache(source.id)
+      __MODULE__.Cache.clear_list_backends(source.id)
 
       if source_sup_started?(source) do
         previous_backends = source_with_backends.backends
@@ -394,16 +394,6 @@ defmodule Logflare.Backends do
     end
   end
 
-  @doc """
-  Clears cached `list_backends` queries for a specific source.
-  """
-  @spec clear_list_backends_cache(source_id :: integer()) :: :ok
-  def clear_list_backends_cache(source_id) when is_integer(source_id) do
-    Cachex.del(__MODULE__.Cache, {:list_backends, [[source_id: source_id]]})
-    Cachex.del(__MODULE__.Cache, {:list_backends, [source_id: source_id]})
-    :ok
-  end
-
   # common typecasting from string map to attom for config
   def typecast_config_string_map_to_atom_map(nil), do: nil
 
@@ -433,18 +423,22 @@ defmodule Logflare.Backends do
   end
 
   @doc """
-  Retrieves a Backend by id.
+  Retrieves a Backend by any field value.
+  """
+  @spec get_backend_by(keyword()) :: Backend.t() | nil
+  def get_backend_by(kw) do
+    Repo.get_by(Backend, kw)
+    |> typecast_config_string_map_to_atom_map()
+  end
+
+  @doc """
+  Similar to `get_backend_by/1` but returns a tuple instead
   """
   @spec fetch_backend_by(keyword()) :: {:ok, Backend.t()} | {:error, :not_found}
   def fetch_backend_by(kw) do
-    backend =
-      Repo.get_by(Backend, kw)
-      |> typecast_config_string_map_to_atom_map()
-
-    if backend do
-      {:ok, backend}
-    else
-      {:error, :not_found}
+    case get_backend_by(kw) do
+      nil -> {:error, :not_found}
+      backend -> {:ok, backend}
     end
   end
 
@@ -510,7 +504,7 @@ defmodule Logflare.Backends do
   def sync_backends_local(%Backend{} = backend, sources) do
     for source <- sources do
       SourceSup.start_backend_child(source, backend)
-      clear_list_backends_cache(source.id)
+      __MODULE__.Cache.clear_list_backends(source.id)
     end
 
     :ok

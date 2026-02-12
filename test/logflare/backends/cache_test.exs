@@ -36,4 +36,16 @@ defmodule Logflare.Backends.CacheTest do
 
     assert Backends.Cache.get_backend(backend.id)
   end
+
+  test "list_backends and clear", %{source: source, backend: backend} do
+    assert Cachex.size!(Backends.Cache) == 0
+    backend_id = backend.id
+
+    assert [%Backends.Backend{id: ^backend_id}] =
+             Backends.Cache.list_backends(source_id: source.id)
+
+    assert Cachex.size!(Backends.Cache) == 1
+    assert :ok = Backends.Cache.clear_list_backends(source.id)
+    assert Cachex.size!(Backends.Cache) == 0
+  end
 end
