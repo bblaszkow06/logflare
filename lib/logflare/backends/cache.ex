@@ -47,7 +47,8 @@ defmodule Logflare.Backends.Cache do
   @doc """
   Fechtches backend by token and user id with caching.
   """
-  @spec fetch_backend_by_token(binary(), integer()) :: {:ok, Backend.t()} | {:error, :not_found}
+  @spec fetch_backend_by_token(binary(), integer()) ::
+          {:ok, Backends.Backend.t()} | {:error, :not_found}
   def fetch_backend_by_token(token, user_id) do
     case get_backend_by(token: token, user_id: user_id) do
       nil -> {:error, :not_found}
