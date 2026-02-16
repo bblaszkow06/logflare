@@ -34,7 +34,7 @@ defmodule LogflareWeb.Api.BackendController do
   )
 
   def show(%{assigns: %{user: user}} = conn, %{"token" => token}) do
-    with {:ok, backend} <- Backends.fetch_backend_by(token: token, user_id: user.id) do
+    with {:ok, backend} <- Backends.Cache.fetch_backend_by_token(token, user.id) do
       json(conn, backend)
     end
   end
@@ -70,7 +70,7 @@ defmodule LogflareWeb.Api.BackendController do
   )
 
   def update(%{assigns: %{user: user}} = conn, %{"token" => token} = params) do
-    with {:ok, backend} <- Backends.fetch_backend_by(token: token, user_id: user.id),
+    with {:ok, backend} <- Backends.Cache.fetch_backend_by_token(token, user.id),
          {:ok, updated} <- Backends.update_backend(backend, params) do
       conn
       |> case do
@@ -95,8 +95,10 @@ defmodule LogflareWeb.Api.BackendController do
   )
 
   def delete(%{assigns: %{user: user}} = conn, %{"token" => token}) do
-    with {:ok, backend} <- Backends.fetch_backend_by(token: token, user_id: user.id),
+    with {:ok, backend} <- Backends.Cache.fetch_backend_by_token(token, user.id),
          {:ok, _} <- Backends.delete_backend(backend) do
+      :ok = Backends.Cache.clear_backend_by_token(token, user.id)
+
       conn
       |> Plug.Conn.send_resp(204, [])
       |> Plug.Conn.halt()
@@ -113,7 +115,7 @@ defmodule LogflareWeb.Api.BackendController do
   )
 
   def test_connection(%{assigns: %{user: user}} = conn, %{"token" => token}) do
-    with {:ok, backend} <- Backends.fetch_backend_by(token: token, user_id: user.id) do
+    with {:ok, backend} <- Backends.Cache.fetch_backend_by_token(token, user.id) do
       case Backends.test_connection(backend) do
         :ok ->
           conn
