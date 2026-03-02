@@ -21,6 +21,7 @@ defmodule Logflare.Backends do
   alias Logflare.PubSubRates
   alias Logflare.Repo
   alias Logflare.Rules.Rule
+  alias Logflare.Sampling
   alias Logflare.SingleTenant
   alias Logflare.Sources
   alias Logflare.Sources.Counters
@@ -564,6 +565,7 @@ defmodule Logflare.Backends do
   def ingest_logs(event_params, source, backend \\ nil) do
     ensure_source_sup_started(source)
     {log_events, errors} = split_valid_events(source, event_params)
+    log_events = Sampling.sample(log_events, source.sampling_ratio)
     count = Enum.count(log_events)
     increment_counters(source, count)
     maybe_broadcast_and_route(source, log_events)
@@ -666,79 +668,48 @@ defmodule Logflare.Backends do
   end
 
   # send to a specific backend
-  defp dispatch_to_backends(source, %Backend{consolidated_ingest?: true} = backend, log_events) do
-    telemetry_metadata = %{backend_type: backend.type}
-
-    :telemetry.span([:logflare, :backends, :ingest, :dispatch], telemetry_metadata, fn ->
-      log_events = maybe_pre_ingest(source, backend, log_events)
-      IngestEventQueue.add_to_table({:consolidated, backend.id}, log_events)
-
-      :telemetry.execute(
-        [:logflare, :backends, :ingest, :count],
-        %{count: length(log_events)},
-        %{backend_type: backend.type}
-      )
-
-      {:ok, telemetry_metadata}
-    end)
-  end
-
   defp dispatch_to_backends(source, %Backend{} = backend, log_events) do
-    telemetry_metadata = %{backend_type: backend.type}
-
-    :telemetry.span([:logflare, :backends, :ingest, :dispatch], telemetry_metadata, fn ->
-      log_events = maybe_pre_ingest(source, backend, log_events)
-
-      queue_key =
-        if backend.consolidated_ingest?,
-          do: {:consolidated, backend.id},
-          else: {source.id, backend.id}
-
-      IngestEventQueue.add_to_table(queue_key, log_events)
-
-      :telemetry.execute(
-        [:logflare, :backends, :ingest, :count],
-        %{count: length(log_events)},
-        %{backend_type: backend.type}
-      )
-
-      {:ok, telemetry_metadata}
-    end)
+    dispatch_single_backend(source, backend, backend.type, log_events)
   end
 
+  # fan-out to all backends
   defp dispatch_to_backends(source, nil, log_events) do
     backends = __MODULE__.Cache.list_backends(source_id: source.id)
 
     for backend <- [nil | backends] do
-      {queue_key, backend_type} =
+      backend_type =
+        if backend, do: backend.type, else: SingleTenant.backend_type()
+
+      dispatch_single_backend(source, backend, backend_type, log_events)
+    end
+  end
+
+  defp dispatch_single_backend(source, backend, backend_type, log_events) do
+    telemetry_metadata = %{backend_type: backend_type}
+
+    :telemetry.span([:logflare, :backends, :ingest, :dispatch], telemetry_metadata, fn ->
+      log_events =
+        if backend, do: maybe_pre_ingest(source, backend, log_events), else: log_events
+
+      log_events = Sampling.sample(log_events, backend && backend.sampling_ratio)
+
+      queue_key =
         case backend do
-          nil ->
-            {{source.id, nil}, SingleTenant.backend_type()}
-
-          %Backend{consolidated_ingest?: true} ->
-            {{:consolidated, backend.id}, backend.type}
-
-          %Backend{} ->
-            {{source.id, backend.id}, backend.type}
+          nil -> {source.id, nil}
+          %Backend{consolidated_ingest?: true} -> {:consolidated, backend.id}
+          %Backend{} -> {source.id, backend.id}
         end
 
-      telemetry_metadata = %{backend_type: backend_type}
+      IngestEventQueue.add_to_table(queue_key, log_events)
 
-      :telemetry.span([:logflare, :backends, :ingest, :dispatch], telemetry_metadata, fn ->
-        log_events =
-          if backend, do: maybe_pre_ingest(source, backend, log_events), else: log_events
+      :telemetry.execute(
+        [:logflare, :backends, :ingest, :dispatch],
+        %{count: length(log_events)},
+        %{backend_type: backend_type}
+      )
 
-        IngestEventQueue.add_to_table(queue_key, log_events)
-
-        :telemetry.execute(
-          [:logflare, :backends, :ingest, :dispatch],
-          %{count: length(log_events)},
-          %{backend_type: backend_type}
-        )
-
-        {:ok, telemetry_metadata}
-      end)
-    end
+      {:ok, telemetry_metadata}
+    end)
   end
 
   defp maybe_pre_ingest(source, backend, events) do

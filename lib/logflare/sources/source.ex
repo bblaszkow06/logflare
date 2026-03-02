@@ -144,6 +144,8 @@ defmodule Logflare.Sources.Source do
     field :system_source_type, Ecto.Enum, values: @system_source_types
     field :labels, :string
 
+    field :sampling_ratio, :float
+
     field :default_ingest_backend_enabled?, :boolean,
       source: :default_ingest_backend_enabled,
       default: false
@@ -204,6 +206,7 @@ defmodule Logflare.Sources.Source do
       :default_ingest_backend_enabled?,
       :bq_storage_write_api,
       :labels,
+      :sampling_ratio,
       :system_source,
       :system_source_type
     ])
@@ -236,7 +239,8 @@ defmodule Logflare.Sources.Source do
       :disable_tailing,
       :default_ingest_backend_enabled?,
       :bq_storage_write_api,
-      :labels
+      :labels,
+      :sampling_ratio
     ])
     |> cast_embed(:notifications, with: &Notifications.changeset/2)
     |> default_validations(source)
@@ -250,6 +254,10 @@ defmodule Logflare.Sources.Source do
     |> unique_constraint(:public_token)
     |> put_source_ttl_change()
     |> validate_source_ttl(source)
+    |> validate_number(:sampling_ratio,
+      greater_than_or_equal_to: 0.0,
+      less_than_or_equal_to: 1.0
+    )
     |> normalize_and_validate_labels()
   end
 

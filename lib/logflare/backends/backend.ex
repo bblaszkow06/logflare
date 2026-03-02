@@ -41,6 +41,7 @@ defmodule Logflare.Backends.Backend do
     field :consolidated_ingest?, :boolean, virtual: true, default: false
     field :metadata, :map
     field :default_ingest?, :boolean, source: :default_ingest, default: false
+    field :sampling_ratio, :float
 
     belongs_to :user, User
 
@@ -60,9 +61,22 @@ defmodule Logflare.Backends.Backend do
 
   def changeset(backend, attrs) do
     backend
-    |> cast(attrs, [:type, :config, :user_id, :name, :description, :metadata, :default_ingest?])
+    |> cast(attrs, [
+      :type,
+      :config,
+      :user_id,
+      :name,
+      :description,
+      :metadata,
+      :default_ingest?,
+      :sampling_ratio
+    ])
     |> validate_required([:user_id, :type, :config, :name])
     |> validate_inclusion(:type, Map.keys(@adaptor_mapping))
+    |> validate_number(:sampling_ratio,
+      greater_than_or_equal_to: 0.0,
+      less_than_or_equal_to: 1.0
+    )
     |> validate_config()
     |> validate_default_ingest()
     |> do_config_change()
