@@ -1,94 +1,89 @@
 defmodule Logflare.Backends.Adaptor.BigQueryAdaptor.GoogleApiClient do
   @moduledoc false
-  alias Google.Cloud.Bigquery.Storage.V1.BigQueryWrite
+
   alias Google.Cloud.Bigquery.Storage.V1.AppendRowsRequest
   alias Google.Cloud.Bigquery.Storage.V1.AppendRowsRequest.ArrowData
   alias Google.Cloud.Bigquery.Storage.V1.ArrowRecordBatch
+  alias Google.Cloud.Bigquery.Storage.V1.BigQueryWrite
   alias Logflare.Backends.Adaptor.BigQueryAdaptor.ArrowIPC
+  alias Logflare.Networking.GrpcPool
+
   require Logger
 
-  @finch_instance_name Logflare.FinchBQStorageWrite
+  @spec connetion_pool_name() :: module()
+  def connetion_pool_name(), do: GrpcPool
 
+  @spec append_rows({:arrow, list()}, keyword(), String.t()) :: :ok | {:error, term()}
   def append_rows({:arrow, data_frame}, context, table) do
-    partition_count = System.schedulers_online()
-    partition = :erlang.phash2(self(), partition_count)
-
     project = context[:project_id]
     dataset = context[:dataset_id]
 
-    {:ok, goth_token} = Goth.fetch({Logflare.Goth, partition})
+    with {:ok, channel} <- GrpcPool.get_channel(connetion_pool_name()) do
+      {arrow_schema, batch_msgs} =
+        data_frame
+        |> Enum.map_join("\n", &Jason.encode!/1)
+        |> ArrowIPC.get_ipc_bytes()
 
-    {:ok, channel} =
-      GRPC.Stub.connect("https://bigquerystorage.googleapis.com",
-        adapter: GRPC.Client.Adapters.Finch,
-        adapter_opts: [instance_name: @finch_instance_name],
-        headers: [
-          {"Authorization", "Bearer #{goth_token.token}"}
-        ]
-      )
+      writer_schema = %Google.Cloud.Bigquery.Storage.V1.ArrowSchema{
+        serialized_schema: arrow_schema
+      }
 
-    {arrow_schema, batch_msgs} =
-      data_frame
-      |> Enum.map_join("\n", &Jason.encode!/1)
-      |> ArrowIPC.get_ipc_bytes()
+      stream = BigQueryWrite.Stub.append_rows(channel)
 
-    writer_schema = %Google.Cloud.Bigquery.Storage.V1.ArrowSchema{serialized_schema: arrow_schema}
+      if length(batch_msgs) > 1 do
+        Logger.warning("Storage Write ArrowIPC.get_ipc_bytes produced more than one batch message")
+      end
 
-    stream = BigQueryWrite.Stub.append_rows(channel)
-
-    if length(batch_msgs) > 1 do
-      Logger.warning("Storage Write ArrowIPC.get_ipc_bytes produced more than one batch message")
-    end
-
-    Enum.each(
-      batch_msgs,
-      fn ipc_msg ->
-        arrow_record_batch = %ArrowRecordBatch{
-          serialized_record_batch: ipc_msg
-        }
-
-        arrow_rows = %ArrowData{rows: arrow_record_batch, writer_schema: writer_schema}
-
-        request =
-          %AppendRowsRequest{
-            write_stream:
-              "projects/#{project}/datasets/#{dataset}/tables/#{table}/streams/_default",
-            rows: {:arrow_rows, arrow_rows}
+      stream =
+        Enum.reduce(batch_msgs, stream, fn ipc_msg, stream ->
+          arrow_record_batch = %ArrowRecordBatch{
+            serialized_record_batch: ipc_msg
           }
 
-        GRPC.Stub.send_request(stream, request)
-      end
-    )
+          arrow_rows = %ArrowData{rows: arrow_record_batch, writer_schema: writer_schema}
 
-    GRPC.Stub.end_stream(stream)
+          request =
+            %AppendRowsRequest{
+              write_stream:
+                "projects/#{project}/datasets/#{dataset}/tables/#{table}/streams/_default",
+              rows: {:arrow_rows, arrow_rows}
+            }
 
-    GRPC.Stub.recv(stream)
-    |> case do
-      {:ok, responses} ->
-        Enum.each(responses, fn
-          {:error, response} ->
-            Logger.warning("Storage Write API AppendRows response error - #{inspect(response)}")
-
-          {:ok, %{response: {:error, %{message: msg}}}} ->
-            Logger.warning(
-              "Storage Write API AppendRows response with error msg - #{inspect(msg)}"
-            )
-
-            :ok
-
-          _ ->
-            :ok
+          GRPC.Stub.send_request(stream, request)
         end)
 
-        :ok
+      GRPC.Stub.end_stream(stream)
 
-      {:error, response} = err ->
-        Logger.warning("Storage Write API AppendRows  error - #{inspect(response)}")
-        err
+      GRPC.Stub.recv(stream)
+      |> case do
+        {:ok, responses} ->
+          Enum.each(responses, fn
+            {:error, response} ->
+              Logger.warning(
+                "Storage Write API AppendRows response error - #{inspect(response)}"
+              )
+
+            {:ok, %{response: {:error, %{message: msg}}}} ->
+              Logger.warning(
+                "Storage Write API AppendRows response with error msg - #{inspect(msg)}"
+              )
+
+              :ok
+
+            _ ->
+              :ok
+          end)
+
+          :ok
+
+        {:error, response} = err ->
+          Logger.warning("Storage Write API AppendRows  error - #{inspect(response)}")
+          err
+      end
+    else
+      {:error, :not_connected} ->
+        Logger.warning("GrpcPool: no channel available for BigQuery Storage Write")
+        {:error, :grpc_not_connected}
     end
-  end
-
-  def get_finch_instance_name() do
-    @finch_instance_name
   end
 end
