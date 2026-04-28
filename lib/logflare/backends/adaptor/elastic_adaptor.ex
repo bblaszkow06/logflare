@@ -11,6 +11,7 @@ defmodule Logflare.Backends.Adaptor.ElasticAdaptor do
   """
 
   alias Logflare.Backends.Adaptor.WebhookAdaptor
+  alias Logflare.Backends.Backend
   alias Logflare.Utils
 
   @behaviour Logflare.Backends.Adaptor
@@ -41,12 +42,25 @@ defmodule Logflare.Backends.Adaptor.ElasticAdaptor do
         else
           %{}
         end
+        |> Map.put("Content-Type", "application/json")
     }
   end
 
   @impl Logflare.Backends.Adaptor
   def redact_config(config) do
     Map.replace_lazy(config, :password, fn _ -> "REDACTED" end)
+  end
+
+  @impl Logflare.Backends.Adaptor
+  @spec test_connection(Backend.t()) :: :ok | {:error, term()}
+  def test_connection(%Backend{} = backend) do
+    backend = %{backend | config: transform_config(backend)}
+
+    WebhookAdaptor.test_connection(backend, "{[]}")
+    |> case do
+      {:error, ~s|Unexpected response: 400 %{"message" => "malformed JSON object| <> _} -> :ok
+      other_error -> other_error
+    end
   end
 
   @impl Logflare.Backends.Adaptor
