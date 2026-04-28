@@ -7,6 +7,67 @@ defmodule Logflare.Backends.Adaptor.BigQueryAdaptorTest do
   alias Logflare.Backends.Adaptor.BigQueryAdaptor
   alias Logflare.Backends.Adaptor.QueryResult
 
+  describe "test_connection/1" do
+    setup do
+      insert(:plan)
+      user = insert(:user)
+      source = insert(:source, user: user)
+
+      backend =
+        insert(:backend,
+          type: :bigquery,
+          sources: [source],
+          config: %{project_id: "my-project", dataset_id: "my_dataset"}
+        )
+
+      [backend: backend]
+    end
+
+    test "calls Datasets.get for the configured project/dataset", %{backend: backend} do
+      this = self()
+      ref = make_ref()
+
+      stub(GoogleApi.BigQuery.V2.Api.Datasets, :bigquery_datasets_get, fn _conn,
+                                                                          project_id,
+                                                                          dataset_id ->
+        send(this, {ref, project_id, dataset_id})
+        {:ok, %GoogleApi.BigQuery.V2.Model.Dataset{}}
+      end)
+
+      assert :ok = BigQueryAdaptor.test_connection(backend)
+      assert_received {^ref, "my-project", "my_dataset"}
+    end
+
+    test "returns error on Tesla.Env failure", %{backend: backend} do
+      stub(GoogleApi.BigQuery.V2.Api.Datasets, :bigquery_datasets_get, fn _conn, _proj, _ds ->
+        {:error, %Tesla.Env{status: 404, body: ~s({"error":{"message":"dataset not found"}})}}
+      end)
+
+      assert {:error, reason} = BigQueryAdaptor.test_connection(backend)
+      assert reason =~ "404"
+    end
+
+    test "returns error on transport failure", %{backend: backend} do
+      stub(GoogleApi.BigQuery.V2.Api.Datasets, :bigquery_datasets_get, fn _conn, _proj, _ds ->
+        {:error, :timeout}
+      end)
+
+      assert {:error, reason} = BigQueryAdaptor.test_connection(backend)
+      assert reason =~ "timeout"
+    end
+
+    test "returns error when project_id or dataset_id is missing" do
+      insert(:plan)
+      user = insert(:user)
+      source = insert(:source, user: user)
+
+      backend = insert(:backend, type: :bigquery, sources: [source], config: %{})
+
+      assert {:error, reason} = BigQueryAdaptor.test_connection(backend)
+      assert reason =~ "project_id"
+    end
+  end
+
   describe "ecto_to_sql/2" do
     test "converts Ecto query to BigQuery SQL format" do
       query =

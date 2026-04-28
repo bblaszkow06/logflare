@@ -11,9 +11,10 @@ defmodule Logflare.Backends.Adaptor.BigQueryAdaptor do
   require OpenTelemetry.Tracer
 
   alias Ecto.Changeset
+  alias GoogleApi.BigQuery.V2.Api.Datasets
+  alias GoogleApi.BigQuery.V2.Model
   alias GoogleApi.IAM.V1.Api.Projects, as: IAMProjects
   alias GoogleApi.IAM.V1.Model.CreateServiceAccountRequest
-  alias GoogleApi.BigQuery.V2.Model
   alias Logflare.Backends
   alias Logflare.Backends.Adaptor.BigQueryAdaptor.GoogleApiClient
   alias Logflare.Backends.Backend
@@ -248,6 +249,26 @@ defmodule Logflare.Backends.Adaptor.BigQueryAdaptor do
   @impl Logflare.Backends.Adaptor
   def validate_config(changeset),
     do: changeset
+
+  @impl Logflare.Backends.Adaptor
+  @spec test_connection(Backend.t()) :: :ok | {:error, term()}
+  def test_connection(%Backend{config: %{project_id: project_id, dataset_id: dataset_id}})
+      when is_non_empty_binary(project_id) and is_non_empty_binary(dataset_id) do
+    conn = GenUtils.get_conn()
+
+    case Datasets.bigquery_datasets_get(conn, project_id, dataset_id) do
+      {:ok, _dataset} ->
+        :ok
+
+      {:error, %Tesla.Env{status: status, body: body}} ->
+        {:error, "BigQuery returned #{status}: #{inspect(body)}"}
+
+      {:error, reason} ->
+        {:error, "Request error: #{inspect(reason)}"}
+    end
+  end
+
+  def test_connection(%Backend{}), do: {:error, "project_id and dataset_id must be set"}
 
   @doc """
   Returns the email of a managed service account
