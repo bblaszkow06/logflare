@@ -11,6 +11,7 @@ defmodule Logflare.Backends.Adaptor.ElasticAdaptor do
   """
 
   alias Logflare.Backends.Adaptor.WebhookAdaptor
+  alias Logflare.Backends.Backend
   alias Logflare.Utils
 
   @behaviour Logflare.Backends.Adaptor
@@ -47,6 +48,13 @@ defmodule Logflare.Backends.Adaptor.ElasticAdaptor do
   @impl Logflare.Backends.Adaptor
   def redact_config(config) do
     Map.replace_lazy(config, :password, fn _ -> "REDACTED" end)
+  end
+
+  @impl Logflare.Backends.Adaptor
+  @spec test_connection(Backend.t()) :: :ok | {:error, term()}
+  def test_connection(%Backend{} = backend) do
+    backend = %{backend | config: transform_config(backend)}
+    WebhookAdaptor.test_connection(backend)
   end
 
   @impl Logflare.Backends.Adaptor

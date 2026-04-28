@@ -17,6 +17,75 @@ defmodule Logflare.Backends.Adaptor.ElasticAdaptorTest do
     :ok
   end
 
+  describe "test_connection/1" do
+    setup do
+      user = insert(:user)
+      source = insert(:source, user: user)
+
+      backend =
+        insert(:backend,
+          type: :elastic,
+          sources: [source],
+          config: %{url: "https://elastic.example.com:9200/_bulk"}
+        )
+
+      [backend: backend]
+    end
+
+    test "POSTs an empty array to the configured URL", %{backend: backend} do
+      @client
+      |> expect(:send, fn req ->
+        assert req[:url] == "https://elastic.example.com:9200/_bulk"
+        assert req[:body] == []
+        {:ok, %Tesla.Env{status: 200, body: ""}}
+      end)
+
+      assert :ok = @subject.test_connection(backend)
+    end
+
+    test "passes Basic auth header when credentials are configured" do
+      user = insert(:user)
+      source = insert(:source, user: user)
+
+      backend =
+        insert(:backend,
+          type: :elastic,
+          sources: [source],
+          config: %{
+            url: "https://elastic.example.com:9200/_bulk",
+            username: "admin",
+            password: "secret"
+          }
+        )
+
+      @client
+      |> expect(:send, fn req ->
+        assert req[:headers]["Authorization"] =~ ~r/^Basic /
+        {:ok, %Tesla.Env{status: 200, body: ""}}
+      end)
+
+      assert :ok = @subject.test_connection(backend)
+    end
+
+    test "returns error on non-2xx response", %{backend: backend} do
+      @client
+      |> expect(:send, fn _req ->
+        {:ok, %Tesla.Env{status: 401, body: %{"error" => "unauthorized"}}}
+      end)
+
+      assert {:error, reason} = @subject.test_connection(backend)
+      assert reason =~ "401"
+    end
+
+    test "returns error on transport failure", %{backend: backend} do
+      @client
+      |> expect(:send, fn _req -> {:error, :nxdomain} end)
+
+      assert {:error, reason} = @subject.test_connection(backend)
+      assert reason =~ "nxdomain"
+    end
+  end
+
   describe "cast and validate" do
     test "API key is required" do
       changeset = Adaptor.cast_and_validate_config(@subject, %{})
