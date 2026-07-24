@@ -46,6 +46,7 @@ defmodule Logflare.Backends.Supervisor do
         Backends.Adaptor.PostgresAdaptor.Supervisor,
         Backends.Adaptor.ClickHouseAdaptor.MappingConfigStore,
         Backends.Adaptor.ClickHouseAdaptor.QueryConnectionSup,
+        Backends.Adaptor.S3TablesAdaptor.QuerySup,
         Backends.ConsolidatedSup,
         {PartitionSupervisor, child_spec: DynamicSupervisor, name: Backends.SourcesSup},
         {Registry,

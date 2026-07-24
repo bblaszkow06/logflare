@@ -8,9 +8,12 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor do
 
   use Supervisor
 
+  import Logflare.Utils.Guards
+
   alias __MODULE__.CatalogManager
   alias __MODULE__.Native
   alias __MODULE__.Pipeline
+  alias __MODULE__.QuerySession
   alias Ecto.Changeset
   alias Logflare.Backends
   alias Logflare.Backends.Adaptor
@@ -93,6 +96,44 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor do
 
   @impl Adaptor
   def supports_default_ingest?, do: true
+
+  @doc """
+  Queries the backend's live DuckDB session (see `QuerySession`).
+
+  Accepts a bare SQL string, `{sql, params}`, or the endpoint-provided
+  `{sql, declared_params, input_params[, endpoint_query]}` shapes.
+  """
+  @impl Adaptor
+  def execute_query(%Backend{} = backend, query_string, opts)
+      when is_non_empty_binary(query_string) and is_list(opts) do
+    execute_query(backend, {query_string, []}, opts)
+  end
+
+  def execute_query(%Backend{} = backend, {query_string, params}, opts)
+      when is_non_empty_binary(query_string) and is_list(params) do
+    QuerySession.execute(backend, query_string, params, opts)
+  end
+
+  def execute_query(%Backend{} = backend, {query_string, declared_params, input_params}, opts)
+      when is_non_empty_binary(query_string) and is_list(declared_params) and is_map(input_params) do
+    QuerySession.execute(backend, query_string, order_params(declared_params, input_params), opts)
+  end
+
+  def execute_query(
+        %Backend{} = backend,
+        {query_string, declared_params, input_params, _endpoint_query},
+        opts
+      )
+      when is_non_empty_binary(query_string) and is_list(declared_params) and is_map(input_params) do
+    QuerySession.execute(backend, query_string, order_params(declared_params, input_params), opts)
+  end
+
+  # TODO(step2): replace positional extraction with proper `@param -> $n` mapping
+  # via `map_query_parameters/4` + `transform_query/3` (reversing the pg_sql rewrite).
+  @spec order_params([String.t()], map()) :: [term()]
+  defp order_params(declared_params, input_params) do
+    Enum.map(declared_params, &Map.get(input_params, &1))
+  end
 
   @doc false
   @impl Supervisor

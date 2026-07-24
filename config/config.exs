@@ -184,6 +184,10 @@ config :mime, :types, %{
 # use legacy artifacts for users on older CPUs or virtualized environments without advanced CPU features
 config :explorer, use_legacy_artifacts: true
 
+# DuckDB driver for the S3 Tables query engine (Adbc). Configured here so the
+# signed driver is downloaded at compile time rather than lazily at runtime.
+config :adbc, :drivers, [:duckdb]
+
 config :paper_trail, repo: Logflare.Repo
 
 import_config "#{Mix.env()}.exs"
