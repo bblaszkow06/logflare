@@ -5,11 +5,14 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
 
   alias Logflare.Backends
   alias Logflare.Backends.Adaptor
+  alias Logflare.Backends.Adaptor.QueryResult
   alias Logflare.Backends.Adaptor.S3TablesAdaptor
   alias Logflare.Backends.Adaptor.S3TablesAdaptor.CatalogManager
   alias Logflare.Backends.Adaptor.S3TablesAdaptor.IcebergSchema
   alias Logflare.Backends.Adaptor.S3TablesAdaptor.Native
   alias Logflare.Backends.Adaptor.S3TablesAdaptor.Pipeline
+  alias Logflare.Backends.Adaptor.S3TablesAdaptor.QueryBackendSup
+  alias Logflare.Backends.Adaptor.S3TablesAdaptor.QuerySup
   alias Logflare.Mapper.OtelDefaults
   alias Logflare.S3TablesMockServer
   alias Logflare.SystemMetrics.AllLogsLogged
@@ -353,6 +356,19 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
       raise "the :integration suite runs against real AWS and requires #{var} to be set"
   end
 
+  defp s3_tables_config(_ctx) do
+    config =
+      %{
+        table_bucket_arn: integration_env!("LOGFLARE_S3_TABLES_TEST_BUCKET_ARN"),
+        namespace: integration_env!("LOGFLARE_S3_TABLES_TEST_NAMESPACE"),
+        access_key_id: integration_env!("AWS_ACCESS_KEY_ID"),
+        secret_access_key: integration_env!("AWS_SECRET_ACCESS_KEY")
+      }
+
+    assert {:ok, catalog} = S3TablesAdaptor.Native.init_catalog(config)
+    %{config: config, catalog: catalog}
+  end
+
   describe "Native module (integration)" do
     @describetag :integration
     test "invalid credentials" do
@@ -365,29 +381,19 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
     # path runs against the local mock server instead. The target bucket and
     # credentials come from the environment rather than test config so that
     # per-developer AWS secrets never live in the repo.
-    setup do
-      config =
-        %{
-          table_bucket_arn: integration_env!("LOGFLARE_S3_TABLES_TEST_BUCKET_ARN"),
-          namespace: integration_env!("LOGFLARE_S3_TABLES_TEST_NAMESPACE"),
-          access_key_id: integration_env!("AWS_ACCESS_KEY_ID"),
-          secret_access_key: integration_env!("AWS_SECRET_ACCESS_KEY")
-        }
+    setup :s3_tables_config
 
+    setup %{catalog: catalog} do
       # drop the OTEL tables before an integration run so tables created by
       # earlier schema revisions don't leak their stale schemas into the tests
-      {:ok, catalog} = S3TablesAdaptor.Native.init_catalog(config)
-
       for event_type <- IcebergSchema.event_types() do
         S3TablesAdaptor.Native.drop_table(catalog, IcebergSchema.table_name(event_type))
       end
 
-      %{config: config}
+      :ok
     end
 
-    test "ensure_table/5 and table_info/2", %{config: config} do
-      assert {:ok, catalog} = S3TablesAdaptor.Native.init_catalog(config)
-
+    test "ensure_table/5 and table_info/2", %{catalog: catalog} do
       for event_type <- IcebergSchema.event_types() do
         table_name = IcebergSchema.table_name(event_type)
         fields = IcebergSchema.fields(event_type)
@@ -422,8 +428,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
       end
     end
 
-    test "append_batch/3 snapshot generation", %{config: config} do
-      assert {:ok, catalog} = S3TablesAdaptor.Native.init_catalog(config)
+    test "append_batch/3 snapshot generation", %{catalog: catalog} do
       table_name = IcebergSchema.table_name(:log)
 
       assert {:ok, _status} =
@@ -463,8 +468,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
       assert snapshot.summary["added-records"] == "3"
     end
 
-    test "concurrent appends", %{config: config} do
-      assert {:ok, catalog} = S3TablesAdaptor.Native.init_catalog(config)
+    test "concurrent appends", %{catalog: catalog} do
       table_name = IcebergSchema.table_name(:log)
 
       assert {:ok, _status} =
@@ -495,6 +499,85 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
         |> Enum.map(fn {:ok, result} -> result end)
 
       assert [{:ok, %{row_count: 1}}, {:ok, %{row_count: 1}}] = results
+    end
+  end
+
+  describe "execute_query/3 (integration)" do
+    @describetag :integration
+
+    setup :s3_tables_config
+
+    setup %{config: config, catalog: catalog} do
+      table_name = IcebergSchema.table_name(:log)
+
+      # start from an empty table so counts are deterministic
+      S3TablesAdaptor.Native.drop_table(catalog, table_name)
+
+      {:ok, _status} =
+        S3TablesAdaptor.Native.ensure_table(
+          catalog,
+          table_name,
+          IcebergSchema.fields(:log),
+          IcebergSchema.layout(:log),
+          IcebergSchema.table_properties(:log)
+        )
+
+      user = insert(:user)
+      backend = insert(:backend, type: :s3_tables, user: user, config: config)
+
+      on_exit(fn ->
+        case GenServer.whereis(Backends.via_backend(backend, QueryBackendSup)) do
+          pid when is_pid(pid) -> DynamicSupervisor.terminate_child(QuerySup, pid)
+          _ -> :ok
+        end
+      end)
+
+      %{backend: backend, catalog: catalog, table_name: table_name}
+    end
+
+    test "counts ingested rows and probes snapshot staleness on a live session", %{
+      backend: backend,
+      catalog: catalog,
+      table_name: table_name
+    } do
+      now_ns = System.os_time(:nanosecond)
+
+      append = fn range ->
+        ndjson =
+          for n <- range, into: "" do
+            row = %{
+              "id" => Ecto.UUID.generate(),
+              "event_message" => "query integration event #{n}",
+              "timestamp" => now_ns
+            }
+
+            Jason.encode!(row) <> "\n"
+          end
+
+        {:ok, _} = S3TablesAdaptor.Native.append_batch(catalog, table_name, ndjson)
+      end
+
+      append.(1..3)
+
+      assert {:ok, %QueryResult{rows: [%{"c" => 3}]}} =
+               S3TablesAdaptor.execute_query(backend, ~s|SELECT count(*) AS c FROM otel_logs|, [])
+
+      # dotted (ClickHouse-parity Nested) columns must be double-quoted for DuckDB
+      assert {:ok, %QueryResult{}} =
+               S3TablesAdaptor.execute_query(
+                 backend,
+                 ~s|SELECT "event_message" FROM otel_logs LIMIT 5|,
+                 []
+               )
+
+      # staleness probe: ingest more, re-query the SAME live ATTACH session.
+      # 5 => the long-lived session sees new snapshots; 3 => it needs a re-ATTACH (Step 4).
+      append.(4..5)
+
+      assert {:ok, %QueryResult{rows: [%{"c" => count_after}]}} =
+               S3TablesAdaptor.execute_query(backend, ~s|SELECT count(*) AS c FROM otel_logs|, [])
+
+      assert count_after in [3, 5]
     end
   end
 end
