@@ -187,6 +187,7 @@ defmodule Logflare.Mixfile do
       {:explorer, "~> 0.11.1"},
 
       # S3
+      {:adbc, "~> 0.12"},
       {:ex_aws, "~> 2.5"},
       {:ex_aws_s3, "~> 2.5"},
       {:ex_aws_sqs, "~> 3.4"},
