@@ -223,6 +223,8 @@ defmodule Logflare.Endpoints.EndpointQuery do
           :bq_sql | :ch_sql | :pg_sql
   def map_backend_to_language(%Backend{type: :clickhouse}, _supabase_mode), do: :ch_sql
   def map_backend_to_language(%Backend{type: :postgres}, false), do: :pg_sql
+  # PoC: S3 Tables (DuckDB) rides the :pg_sql path; superseded by :duckdb_sql in a later step.
+  def map_backend_to_language(%Backend{type: :s3_tables}, _supabase_mode), do: :pg_sql
   def map_backend_to_language(_backend, _supabase_mode), do: :bq_sql
 
   @spec infer_language_from_backend(%Changeset{}) :: %Changeset{}
