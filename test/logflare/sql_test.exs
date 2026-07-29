@@ -17,6 +17,8 @@ defmodule Logflare.SqlTest do
   @user_dataset_id "user-dataset-id"
   @env "test"
 
+  doctest Sql, import: true
+
   setup do
     insert(:plan)
     values = Application.get_env(:logflare, Logflare.Google)
@@ -511,6 +513,17 @@ defmodule Logflare.SqlTest do
         "select event_message, JSONExtractString(body, 'metadata.custom_user_data.company') AS company, timestamp FROM foo.ch WHERE company = @company"
 
       assert {:ok, %{1 => "company"}} = Sql.parameter_positions(ch_query, dialect: "clickhouse")
+    end
+
+    test "parameter_values orders values by position, ignoring unused keys" do
+      assert Sql.map_query_values(
+               "SELECT @a, @b FROM t WHERE c = @c",
+               %{"a" => 1, "b" => 2, "c" => 3, "unused" => 9}
+             ) == [1, 2, 3]
+    end
+
+    test "parameter_values maps missing params to nil" do
+      assert Sql.map_query_values("SELECT @a, @b", %{"a" => 1}) == [1, nil]
     end
 
     test "sandboxed queries work with simple CTEs" do

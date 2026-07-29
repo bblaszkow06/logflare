@@ -177,13 +177,7 @@ defmodule Logflare.Backends.Adaptor.PostgresAdaptor do
 
   @impl Logflare.Backends.Adaptor
   def map_query_parameters(original_query, _transformed_query, _declared_params, input_params) do
-    {:ok, params} = Sql.parameter_positions(original_query)
-
-    params
-    |> Enum.sort_by(&elem(&1, 0))
-    |> Enum.map(fn {_pos, parameter} ->
-      Map.get(input_params, parameter)
-    end)
+    Sql.map_query_values(original_query, input_params)
   end
 
   @impl Logflare.Backends.Adaptor

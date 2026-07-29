@@ -197,6 +197,18 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
     end
   end
 
+  test "map_query_parameters/4 orders values by their $1..$n positions" do
+    params =
+      S3TablesAdaptor.map_query_parameters(
+        "SELECT id FROM otel_logs WHERE a = @foo AND b = @bar",
+        "ignored transformed query",
+        ["foo", "bar"],
+        %{"foo" => "x", "bar" => "y"}
+      )
+
+    assert params == ["x", "y"]
+  end
+
   describe "execute_query/3 (integration)" do
     @describetag :integration
 
