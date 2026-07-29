@@ -392,8 +392,8 @@ defmodule Logflare.Sql do
 
   ### Example
 
-    iex> sources("select a from my_table", %User{...})
-    {:ok, %{"my_table" => "abced-weqqwe-..."}}
+    sources("select a from my_table", %User{...})
+    # => {:ok, %{"my_table" => "abced-weqqwe-..."}}
   """
   @spec sources(query :: String.t(), user :: User.t(), opts :: Keyword.t()) ::
           {:ok, %{String.t() => String.t()}} | {:error, String.t()}
@@ -472,14 +472,34 @@ defmodule Logflare.Sql do
   Returns parameter positions mapped to their names.
 
   ### Example
-  iex> parameter_positions("select @test as testing")
-  %{1 => "test"}
+
+    iex> parameter_positions("select @test as testing")
+    {:ok, %{1 => "test"}}
   """
   @spec parameter_positions(query :: String.t(), opts :: Keyword.t()) ::
           {:ok, %{integer() => String.t()}}
   def parameter_positions(query, opts \\ []) when is_non_empty_binary(query) and is_list(opts) do
     {:ok, parameters} = parameters(query, opts)
     {:ok, do_parameter_positions_mapping(query, parameters)}
+  end
+
+  @doc """
+  Orders `input_params` values to match the `$1..$n` placeholders emitted for a
+  query's `@param` references, by position. Missing params map to `nil`.
+
+  ### Example
+
+    iex> map_query_values("select @a, @b, @c", %{"a" => 1, "c" => 3})
+    [1, nil, 3]
+  """
+  @spec map_query_values(query :: String.t(), input_params :: map()) :: [term()]
+  def map_query_values(query, input_params)
+      when is_non_empty_binary(query) and is_map(input_params) do
+    {:ok, positions} = parameter_positions(query)
+
+    positions
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map(fn {_position, parameter} -> Map.get(input_params, parameter) end)
   end
 
   @doc """
@@ -525,8 +545,8 @@ defmodule Logflare.Sql do
 
   ### Example
 
-  iex> source_mapping("select a from old_table_name", %{"old_table_name"=> "abcde-fg123-..."}, %User{})
-  {:ok, "select a from new_table_name"}
+      source_mapping("select a from old_table_name", %{"old_table_name"=> "abcde-fg123-..."}, %User{})
+      # => {:ok, "select a from new_table_name"}
   """
   @spec source_mapping(
           query :: String.t(),
