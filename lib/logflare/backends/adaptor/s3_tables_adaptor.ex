@@ -21,21 +21,12 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor do
   alias Logflare.Backends.Backend
   alias Logflare.Backends.IngestEventQueue
   alias Logflare.Backends.QueryError
-  alias Logflare.Sources
-  alias Logflare.Sources.Source
   alias Logflare.Sql
-  alias Logflare.Sql.AstUtils
-  alias Logflare.Sql.Parser
 
   @behaviour Adaptor
 
   @min_batch_timeout 5_000
   @max_batch_timeout 60_000
-
-  # PoC shim: the `:pg_sql` endpoint path only accepts sources named after the
-  # consolidated OTEL Iceberg tables. Superseded by the `:duckdb_sql` language
-  # + `DialectTransformer.DuckDb` in a later step.
-  @otel_source_names ~w(otel_logs otel_metrics otel_traces)
 
   @doc false
   def child_spec(arg) do
@@ -150,21 +141,16 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor do
   end
 
   @doc """
-  Reverses the mandatory `:pg_sql` source-name rewrite so DuckDB sees the Iceberg
-  table names.
+  Prepares an already-transformed query for the DuckDB session, rewriting
+  `@param` references into the `$1..$n` placeholders DuckDB binds
+  (see `map_query_parameters/4` for the matching value order).
 
-  `Sql.transform(:pg_sql, ...)` rewrites each source reference to its physical
-  `log_events_<token>` name; this maps those back to the source's name, which for
-  the PoC must be one of the consolidated OTEL tables (see `@otel_source_names`).
+  `:duckdb_sql` queries are emitted by `Logflare.Sql.DialectTransformer.DuckDb`
+  and need no table rewriting.
   """
   @impl Adaptor
-  def transform_query(query, :pg_sql, _context) when is_non_empty_binary(query) do
-    with {:ok, ast} <- Parser.parse("postgres", query),
-         {:ok, mapping} <- build_source_name_mapping(ast) do
-      ast
-      |> AstUtils.transform_recursive(mapping, &restore_source_name/2)
-      |> Parser.to_string()
-    end
+  def transform_query(query, :duckdb_sql, _context) when is_non_empty_binary(query) do
+    {:ok, Sql.to_positional_parameters(query, dialect: "duckdb")}
   end
 
   def transform_query(_query, from_language, _context) do
@@ -206,74 +192,6 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor do
   end
 
   defp adbc_error_kind(%Adbc.Error{}), do: :backend_error
-
-  @spec build_source_name_mapping([map()]) ::
-          {:ok, %{String.t() => String.t()}} | {:error, String.t()}
-  defp build_source_name_mapping(ast) do
-    ast
-    |> collect_physical_table_names()
-    |> Enum.reduce_while({:ok, %{}}, fn physical_name, {:ok, acc} ->
-      case resolve_source_name(physical_name) do
-        {:ok, source_name} -> {:cont, {:ok, Map.put(acc, physical_name, source_name)}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-  end
-
-  @spec collect_physical_table_names([map()]) :: [String.t()]
-  defp collect_physical_table_names(ast) do
-    ast
-    |> AstUtils.collect_from_ast(fn
-      {"Table", %{"name" => parts}} when is_list(parts) -> {:collect, parts}
-      _ -> :skip
-    end)
-    |> List.flatten()
-    |> Enum.map(& &1["value"])
-    |> Enum.filter(&physical_table_name?/1)
-    |> Enum.uniq()
-  end
-
-  @spec resolve_source_name(String.t()) :: {:ok, String.t()} | {:error, String.t()}
-  defp resolve_source_name(physical_name) do
-    token =
-      physical_name
-      |> String.replace_prefix("log_events_", "")
-      |> String.replace("_", "-")
-
-    # TODO(step2): cache this token -> source lookup (currently a DB hit per referenced source).
-    case Sources.get_source_by_token(token) do
-      %Source{name: name} when name in @otel_source_names ->
-        {:ok, name}
-
-      %Source{name: name} ->
-        {:error, "source #{inspect(name)} is not a queryable OTEL table"}
-
-      nil ->
-        {:error, "no source found for #{physical_name}"}
-    end
-  end
-
-  @spec physical_table_name?(term()) :: boolean()
-  defp physical_table_name?(value) when is_binary(value),
-    do: String.starts_with?(value, "log_events_")
-
-  defp physical_table_name?(_value), do: false
-
-  @spec restore_source_name({String.t(), map()}, map()) :: {:recurse, term()}
-  defp restore_source_name({"Table" = key, %{"name" => parts} = table}, mapping)
-       when is_list(parts) do
-    restored =
-      Enum.map(parts, fn part ->
-        case Map.fetch(mapping, part["value"]) do
-          {:ok, source_name} -> %{part | "value" => source_name}
-          :error -> part
-        end
-      end)
-
-    {:recurse, {key, %{table | "name" => restored}}}
-  end
-
-  defp restore_source_name(node, _mapping), do: {:recurse, node}
 
   @doc false
   @impl Supervisor

@@ -209,6 +209,21 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
     assert params == ["x", "y"]
   end
 
+  describe "transform_query/3" do
+    test ":duckdb_sql needs no further rewriting" do
+      query = ~s|SELECT id FROM (SELECT * FROM otel_logs WHERE source_uuid = 'abc') AS s|
+
+      assert {:ok, ^query} = S3TablesAdaptor.transform_query(query, :duckdb_sql, %{})
+    end
+
+    test "unsupported source language" do
+      assert {:error, message} =
+               S3TablesAdaptor.transform_query("SELECT 1", :bq_sql, %{})
+
+      assert message =~ "not supported"
+    end
+  end
+
   describe "execute_query/3 (integration)" do
     @describetag :integration
 

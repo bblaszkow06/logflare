@@ -23,10 +23,12 @@ defmodule Logflare.Lql do
   @doc """
   Converts a language identifier to a dialect identifier.
   """
-  @spec language_to_dialect(:bq_sql | :ch_sql | :pg_sql) :: dialect()
+  @spec language_to_dialect(:bq_sql | :ch_sql | :duckdb_sql | :pg_sql) :: dialect()
   def language_to_dialect(:bq_sql), do: :bigquery
   def language_to_dialect(:ch_sql), do: :clickhouse
   def language_to_dialect(:pg_sql), do: :postgres
+  # DuckDB speaks the postgres dialect; sandboxed LQL reuses its SQL generation.
+  def language_to_dialect(:duckdb_sql), do: :postgres
   def language_to_dialect(_), do: :bigquery
 
   @doc """

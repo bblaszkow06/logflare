@@ -516,6 +516,7 @@ defmodule LogflareWeb.EndpointsLive do
 
   defp format_query_language(:bq_sql), do: "BigQuery SQL"
   defp format_query_language(:ch_sql), do: "ClickHouse SQL"
+  defp format_query_language(:duckdb_sql), do: "DuckDB SQL"
   defp format_query_language(:pg_sql), do: "Postgres SQL"
   defp format_query_language(language), do: language |> to_string() |> String.upcase()
 
