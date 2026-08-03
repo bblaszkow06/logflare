@@ -18,18 +18,18 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.EndpointQueryTest do
   }
 
   setup do
-    # Sql.transform(:pg_sql, ...) resolves source retention, which needs a Free plan
+    # Sql.transform/3 resolves source retention, which needs a Free plan
     insert(:plan)
     user = insert(:user)
-    insert(:source, user: user, name: "otel_logs")
+    source = insert(:source, user: user, name: "my_otel_source")
     backend = insert(:backend, type: :s3_tables, user: user, config: @config)
 
     endpoint =
       insert(:endpoint,
         user: user,
         backend: backend,
-        language: :pg_sql,
-        query: "SELECT count(*) AS c FROM otel_logs WHERE service_name = @svc"
+        language: :duckdb_sql,
+        query: "SELECT count(*) AS c FROM my_otel_source WHERE service_name = @svc"
       )
 
     on_exit(fn ->
@@ -39,10 +39,11 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.EndpointQueryTest do
       end
     end)
 
-    %{endpoint: endpoint}
+    %{source: source, endpoint: endpoint}
   end
 
-  test "runs a :pg_sql endpoint end-to-end: reverses source name, maps @param to $1", %{
+  test "runs a :duckdb_sql endpoint end-to-end: filters by source_uuid, maps @param to $1", %{
+    source: source,
     endpoint: endpoint
   } do
     test_pid = self()
@@ -60,9 +61,9 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.EndpointQueryTest do
 
     assert {:ok, %{rows: [%{"c" => 42}]}} = Endpoints.run_query(endpoint, %{"svc" => "api"})
 
-    # the SQL that reached the engine has the Iceberg table name and the bound $1 value
     assert_receive {:executed, select_sql, ["api"]}
-    assert select_sql =~ "otel_logs"
+    assert select_sql =~ ~s|FROM (SELECT * FROM otel_logs WHERE source_uuid = '#{source.token}')|
+    assert select_sql =~ "service_name = $1"
     refute select_sql =~ "log_events_"
   end
 
