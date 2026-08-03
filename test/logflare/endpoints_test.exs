@@ -580,6 +580,25 @@ defmodule Logflare.EndpointsTest do
       assert endpoint.backend_id == backend.id
     end
 
+    test "s3_tables backend maps to `duckdb_sql` language" do
+      user = insert(:user)
+      backend = insert(:backend, user: user, type: :s3_tables)
+
+      assert {:ok, endpoint} =
+               Endpoints.create_query(
+                 user,
+                 %{
+                   name: "s3-tables-endpoint",
+                   query: "select count(*) as c from otel_logs",
+                   backend_id: backend.id
+                 },
+                 user
+               )
+
+      assert endpoint.language == :duckdb_sql
+      assert endpoint.backend_id == backend.id
+    end
+
     test "backend does not overwrite explicit language definition" do
       user = insert(:user)
       backend = insert(:backend, user: user, type: :bigquery)
