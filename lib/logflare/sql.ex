@@ -559,10 +559,11 @@ defmodule Logflare.Sql do
     iex> map_query_values("select @a, @b, @c", %{"a" => 1, "c" => 3})
     [1, nil, 3]
   """
-  @spec map_query_values(query :: String.t(), input_params :: map()) :: [term()]
-  def map_query_values(query, input_params)
-      when is_non_empty_binary(query) and is_map(input_params) do
-    {:ok, positions} = parameter_positions(query)
+  @spec map_query_values(query :: String.t(), input_params :: map(), opts :: Keyword.t()) ::
+          [term()]
+  def map_query_values(query, input_params, opts \\ [])
+      when is_non_empty_binary(query) and is_map(input_params) and is_list(opts) do
+    {:ok, positions} = parameter_positions(query, opts)
 
     positions
     |> Enum.sort_by(&elem(&1, 0))
