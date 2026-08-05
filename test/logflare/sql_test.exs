@@ -526,6 +526,14 @@ defmodule Logflare.SqlTest do
       assert Sql.map_query_values("SELECT @a, @b", %{"a" => 1}) == [1, nil]
     end
 
+    test "map_query_values respects the dialect option for dialect-specific syntax" do
+      assert Sql.map_query_values(
+               "SELECT * EXCLUDE (secret) FROM t WHERE a = @a",
+               %{"a" => 1},
+               dialect: "duckdb"
+             ) == [1]
+    end
+
     test "to_positional_parameters numbers repeated and prefix-overlapping params by position" do
       assert Sql.to_positional_parameters("SELECT @a, @a_b FROM t WHERE c = @a") ==
                "SELECT $1, $2 FROM t WHERE c = $3"

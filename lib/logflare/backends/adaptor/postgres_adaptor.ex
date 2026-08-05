@@ -177,7 +177,7 @@ defmodule Logflare.Backends.Adaptor.PostgresAdaptor do
 
   @impl Logflare.Backends.Adaptor
   def map_query_parameters(original_query, _transformed_query, _declared_params, input_params) do
-    Sql.map_query_values(original_query, input_params)
+    Sql.map_query_values(original_query, input_params, dialect: "postgres")
   end
 
   @impl Logflare.Backends.Adaptor

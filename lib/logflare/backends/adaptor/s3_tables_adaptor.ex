@@ -137,7 +137,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor do
   """
   @impl Adaptor
   def map_query_parameters(original_query, _transformed_query, _declared_params, input_params) do
-    Sql.map_query_values(original_query, input_params)
+    Sql.map_query_values(original_query, input_params, dialect: "duckdb")
   end
 
   @doc """
