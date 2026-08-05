@@ -134,8 +134,7 @@ defmodule LogflareWeb.QueryErrorHelpers do
     |> normalize_path_field()
   end
 
-  # Backends without field extraction (e.g. S3 Tables/DuckDB) fall back to the
-  # should fall back to the generic message.
+  # Backends without field extraction should fall back to the generic message.
   defp extract_missing_field(_backend, _message), do: nil
 
   defp extract_field(message, pattern) do

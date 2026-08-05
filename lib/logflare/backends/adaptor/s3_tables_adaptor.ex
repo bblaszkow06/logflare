@@ -133,7 +133,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor do
 
   @doc """
   Orders endpoint parameter values to match the `$1..$n` placeholders in the
-  transformed query (see `Logflare.Sql.parameter_values/2`).
+  transformed query (see `Logflare.Sql.map_query_values/2`).
   """
   @impl Adaptor
   def map_query_parameters(original_query, _transformed_query, _declared_params, input_params) do
