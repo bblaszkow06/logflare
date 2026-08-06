@@ -8,14 +8,20 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor do
 
   use Supervisor
 
+  import Logflare.Utils.Guards
+
   alias __MODULE__.CatalogManager
   alias __MODULE__.Native
   alias __MODULE__.Pipeline
+  alias __MODULE__.QuerySession
   alias Ecto.Changeset
   alias Logflare.Backends
   alias Logflare.Backends.Adaptor
+  alias Logflare.Backends.Adaptor.QueryResult
   alias Logflare.Backends.Backend
   alias Logflare.Backends.IngestEventQueue
+  alias Logflare.Backends.QueryError
+  alias Logflare.Sql
 
   @behaviour Adaptor
 
@@ -93,6 +99,99 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor do
 
   @impl Adaptor
   def supports_default_ingest?, do: true
+
+  @doc """
+  Queries the backend's live DuckDB session (see `QuerySession`).
+
+  Accepts a bare SQL string, `{sql, params}`, or the endpoint-provided
+  `{sql, declared_params, input_params[, endpoint_query]}` shapes.
+  """
+  @impl Adaptor
+  def execute_query(%Backend{} = backend, query_string, opts)
+      when is_non_empty_binary(query_string) and is_list(opts) do
+    execute_query(backend, {query_string, []}, opts)
+  end
+
+  def execute_query(%Backend{} = backend, {query_string, params}, opts)
+      when is_non_empty_binary(query_string) and is_list(params) do
+    run_query(backend, query_string, params, opts)
+  end
+
+  def execute_query(%Backend{} = backend, {query_string, declared_params, input_params}, opts)
+      when is_non_empty_binary(query_string) and is_list(declared_params) and is_map(input_params) do
+    run_query(backend, query_string, order_params(declared_params, input_params), opts)
+  end
+
+  def execute_query(
+        %Backend{} = backend,
+        {query_string, declared_params, input_params, _endpoint_query},
+        opts
+      )
+      when is_non_empty_binary(query_string) and is_list(declared_params) and is_map(input_params) do
+    run_query(backend, query_string, order_params(declared_params, input_params), opts)
+  end
+
+  @doc """
+  Orders endpoint parameter values to match the `$1..$n` placeholders in the
+  transformed query (see `Logflare.Sql.map_query_values/2`).
+  """
+  @impl Adaptor
+  def map_query_parameters(original_query, _transformed_query, _declared_params, input_params) do
+    Sql.map_query_values(original_query, input_params, dialect: "duckdb")
+  end
+
+  @doc """
+  Prepares an already-transformed query for the DuckDB session, rewriting
+  `@param` references into the `$1..$n` placeholders DuckDB binds
+  (see `map_query_parameters/4` for the matching value order).
+
+  `:duckdb_sql` queries are emitted by `Logflare.Sql.DialectTransformer.DuckDb`
+  and need no table rewriting.
+  """
+  @impl Adaptor
+  def transform_query(query, :duckdb_sql, _context) when is_non_empty_binary(query) do
+    {:ok, Sql.to_positional_parameters(query, dialect: "duckdb")}
+  end
+
+  def transform_query(_query, from_language, _context) do
+    {:error, "Transformation from #{from_language} to S3 Tables (DuckDB) not supported"}
+  end
+
+  # Fallback ordering for direct callers; endpoints use `map_query_parameters/4` above.
+  @spec order_params([String.t()], map()) :: [term()]
+  defp order_params(declared_params, input_params) do
+    Enum.map(declared_params, &Map.get(input_params, &1))
+  end
+
+  @spec run_query(Backend.t(), String.t(), [term()], keyword()) ::
+          {:ok, QueryResult.t()} | {:error, QueryError.t()}
+  defp run_query(backend, sql, params, opts) do
+    case QuerySession.execute(backend, sql, params, opts) do
+      {:ok, _result} = ok -> ok
+      # TODO(step3): surface a redacted DuckDB message (never echo raw bootstrap SQL, which carries the secret).
+      {:error, reason} -> {:error, to_query_error(reason)}
+    end
+  end
+
+  @spec to_query_error(term()) :: QueryError.t()
+  defp to_query_error(%Adbc.Error{} = error) do
+    %QueryError{kind: adbc_error_kind(error), raw_error: error, backend: __MODULE__}
+  end
+
+  defp to_query_error(reason) do
+    %QueryError{kind: :backend_error, raw_error: reason, backend: __MODULE__}
+  end
+
+  @spec adbc_error_kind(Adbc.Error.t()) :: QueryError.kind()
+  defp adbc_error_kind(%Adbc.Error{message: message}) when is_binary(message) do
+    if message =~ ~r/Parser Error|Binder Error|Catalog Error|Syntax [Ee]rror/ do
+      :invalid_query
+    else
+      :backend_error
+    end
+  end
+
+  defp adbc_error_kind(%Adbc.Error{}), do: :backend_error
 
   @doc false
   @impl Supervisor

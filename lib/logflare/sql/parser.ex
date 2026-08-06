@@ -7,7 +7,7 @@ defmodule Logflare.Sql.Parser do
 
   import Logflare.Utils.Guards
 
-  @valid_dialects ~w(bigquery clickhouse postgres)
+  @valid_dialects ~w(bigquery clickhouse duckdb postgres)
 
   defmodule Native do
     @moduledoc false

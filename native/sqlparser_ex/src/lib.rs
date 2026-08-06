@@ -3,6 +3,7 @@ use rustler::NifResult;
 use rustler::NifTuple;
 use sqlparser::dialect::BigQueryDialect;
 use sqlparser::dialect::ClickHouseDialect;
+use sqlparser::dialect::DuckDbDialect;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::parser::ParserError::ParserError;
@@ -25,6 +26,7 @@ fn parse(dialect_str: &str, query: &str) -> NifResult<Response> {
     let result = match dialect_str {
         "bigquery" => Parser::parse_sql(&BigQueryDialect {}, query),
         "clickhouse" => Parser::parse_sql(&ClickHouseDialect {}, query),
+        "duckdb" => Parser::parse_sql(&DuckDbDialect {}, query),
         "postgres" => Parser::parse_sql(&PostgreSqlDialect {}, query),
         _ => Err(ParserError(
             "Parser for this dialect is not supported.".to_string(),

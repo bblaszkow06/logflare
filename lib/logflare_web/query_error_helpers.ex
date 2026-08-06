@@ -134,6 +134,9 @@ defmodule LogflareWeb.QueryErrorHelpers do
     |> normalize_path_field()
   end
 
+  # Backends without field extraction should fall back to the generic message.
+  defp extract_missing_field(_backend, _message), do: nil
+
   defp extract_field(message, pattern) do
     case Regex.run(pattern, message) do
       [_match, field] -> field
