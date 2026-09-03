@@ -270,6 +270,11 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
     |> Enum.map(&Jason.decode!/1)
   end
 
+  defp integration_env!(var) do
+    System.get_env(var) ||
+      raise "the :integration suite runs against real AWS and requires #{var} to be set"
+  end
+
   describe "Native module (integration)" do
     @describetag :integration
     test "invalid credentials" do
@@ -277,18 +282,18 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
       assert err =~ "invalid"
     end
 
+    # This suite is an opt-in live smoke test against real AWS
+    # (`mix test --include integration`); day-to-day coverage of the append
+    # path runs against the local mock server instead. The target bucket and
+    # credentials come from the environment rather than test config so that
+    # per-developer AWS secrets never live in the repo.
     setup do
-      table_bucket_arn = System.fetch_env!("LOGFLARE_S3_TABLES_TEST_BUCKET_ARN")
-      namespace = System.fetch_env!("LOGFLARE_S3_TABLES_TEST_NAMESPACE")
-      access_key_id = System.fetch_env!("AWS_ACCESS_KEY_ID")
-      secret_access_key = System.fetch_env!("AWS_SECRET_ACCESS_KEY")
-
       config =
         %{
-          table_bucket_arn: table_bucket_arn,
-          namespace: namespace,
-          access_key_id: access_key_id,
-          secret_access_key: secret_access_key
+          table_bucket_arn: integration_env!("LOGFLARE_S3_TABLES_TEST_BUCKET_ARN"),
+          namespace: integration_env!("LOGFLARE_S3_TABLES_TEST_NAMESPACE"),
+          access_key_id: integration_env!("AWS_ACCESS_KEY_ID"),
+          secret_access_key: integration_env!("AWS_SECRET_ACCESS_KEY")
         }
 
       # drop the OTEL tables before an integration run so tables created by
