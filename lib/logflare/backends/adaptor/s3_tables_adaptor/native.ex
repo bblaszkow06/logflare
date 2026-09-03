@@ -11,8 +11,14 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.Native do
   # error arrives before the receive gives up
   @append_timeout 60_000
 
+  # optional overrides for the AWS S3 Tables API and S3 object-store
+  # endpoints; the NIF requires the keys to be present (nil = use AWS)
+  @endpoint_defaults %{endpoint_url: nil, s3_endpoint: nil}
+
   @spec init_catalog(map()) :: {:ok, reference()} | {:error, String.t()}
   def init_catalog(config) do
+    config = Map.merge(@endpoint_defaults, config)
+
     fn ref -> Nifs.init_catalog(ref, config) end
     |> wrap_sending_nif()
   end
