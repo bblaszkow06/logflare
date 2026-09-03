@@ -40,7 +40,12 @@ defmodule Logflare.S3TablesMockServer do
       Agent.start_link(fn -> %{tables: %{}, objects: %{}, uploads: %{}, token_seq: 0} end)
 
     {:ok, listener} =
-      Bandit.start_link(plug: {__MODULE__, agent}, port: 0, ip: :loopback, startup_log: false)
+      Bandit.start_link(
+        plug: {__MODULE__, {:agent, agent}},
+        port: 0,
+        ip: :loopback,
+        startup_log: false
+      )
 
     {:ok, {_ip, port}} = ThousandIsland.listener_info(listener)
 
@@ -56,10 +61,10 @@ defmodule Logflare.S3TablesMockServer do
   def object_keys(%{agent: agent}), do: Agent.get(agent, &Map.keys(&1.objects))
 
   @impl Plug
-  def init(agent), do: agent
+  def init(opts), do: opts
 
   @impl Plug
-  def call(conn, agent) do
+  def call(conn, {:agent, agent}) do
     conn = fetch_query_params(conn)
     {body, conn} = read_full_body(conn)
     route(conn, conn.method, conn.path_info, body, agent)
