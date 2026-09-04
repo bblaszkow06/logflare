@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use arrow_json::ReaderBuilder;
 use iceberg::arrow::{schema_to_arrow_schema, RecordBatchPartitionSplitter};
-use iceberg::spec::{DataFileFormat, Transform, UnboundPartitionSpec};
+use iceberg::spec::DataFileFormat;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -24,8 +24,10 @@ use rustler::{Atom as NifAtom, Encoder, Env, NifMap, Resource, ResourceArc, Term
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
+mod layout;
 mod schema;
 
+use layout::LayoutSpec;
 use schema::FieldSpec;
 
 mod atoms {
@@ -47,8 +49,6 @@ const APPEND_TIMEOUT: Duration = Duration::from_secs(55);
 /// Rows buffered per decoded `RecordBatch` before it is streamed into the
 /// parquet writer; bounds decoder memory independently of payload size.
 const DECODER_BATCH_SIZE: usize = 8192;
-
-const TIMESTAMP_PARTITION_NAME: &str = "timestamp_day";
 
 /// Handle to a constructed S3 Tables catalog client, held across NIF calls.
 pub struct CatalogResource {
@@ -169,10 +169,11 @@ fn init_catalog<'a>(env: Env<'a>, result_tag: Term<'a>, config: Config) -> NifAt
     })
 }
 
-/// Creates the Iceberg table for `table_name` from the given field list if it doesn't already
-/// exist, stamping `properties` (e.g. `logflare.schema-version`) into the table metadata.
-/// Idempotent: returns `{:ok, :already_exists}` both when the table was already present
-/// and when AWS reports a conflict from a concurrent create.
+/// Creates the Iceberg table for `table_name` from the given field list and layout
+/// (partition spec + sort order) if it doesn't already exist, stamping `properties`
+/// (e.g. `logflare.schema-version`) into the table metadata. Idempotent: returns
+/// `{:ok, :already_exists}` both when the table was already present and when AWS
+/// reports a conflict from a concurrent create.
 #[rustler::nif]
 fn ensure_table<'a>(
     env: Env<'a>,
@@ -180,6 +181,7 @@ fn ensure_table<'a>(
     catalog: ResourceArc<CatalogResource>,
     table_name: String,
     fields: Vec<FieldSpec>,
+    layout: LayoutSpec,
     properties: HashMap<String, String>,
 ) -> NifAtom {
     spawn_reply(env, result_tag, async move {
@@ -191,17 +193,15 @@ fn ensure_table<'a>(
             Err(err) => return Err(fmt_err(err)),
         }
 
-        let (table_schema, timestamp_field_id) = schema::build(&fields)?;
-
-        let partition_spec = UnboundPartitionSpec::builder()
-            .add_partition_field(timestamp_field_id, TIMESTAMP_PARTITION_NAME, Transform::Day)
-            .map_err(fmt_err)?
-            .build();
+        let (table_schema, field_ids) = schema::build(&fields)?;
+        let partition_spec = layout.partition_spec(&field_ids)?;
+        let sort_order = layout.sort_order(&field_ids, &table_schema)?;
 
         let creation = TableCreation::builder()
             .name(table_name)
             .schema(table_schema)
             .partition_spec(partition_spec)
+            .sort_order(sort_order)
             .properties(properties)
             .build();
 
@@ -230,11 +230,15 @@ fn ensure_table<'a>(
 #[derive(NifMap)]
 struct TableInfo {
     columns: Vec<String>,
+    partition: Vec<String>,
+    sort_order: Vec<String>,
     properties: HashMap<String, String>,
 }
 
-/// Returns the current column names and table properties of an existing
+/// Returns the current column names, layout and table properties of an existing
 /// Iceberg table, used to confirm table creation and detect schema drift.
+/// `partition` holds the partition field names, `sort_order` the source column
+/// names of the default sort order, in sort precedence.
 #[rustler::nif]
 fn table_info<'a>(
     env: Env<'a>,
@@ -252,17 +256,40 @@ fn table_info<'a>(
             .map_err(fmt_err)?;
 
         let metadata = table.metadata();
+        let schema = metadata.current_schema();
 
-        let columns = metadata
-            .current_schema()
+        let columns = schema
             .as_struct()
             .fields()
             .iter()
             .map(|field| field.name.clone())
             .collect::<Vec<String>>();
 
+        let partition = metadata
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<String>>();
+
+        // a sort field names its source column by id; an id the current schema
+        // dropped is surfaced as-is rather than silently skipped
+        let sort_order = metadata
+            .default_sort_order()
+            .fields
+            .iter()
+            .map(|field| {
+                schema
+                    .name_by_field_id(field.source_id)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("field-{}", field.source_id))
+            })
+            .collect::<Vec<String>>();
+
         Ok::<_, String>(TableInfo {
             columns,
+            partition,
+            sort_order,
             properties: metadata.properties().clone(),
         })
     })
