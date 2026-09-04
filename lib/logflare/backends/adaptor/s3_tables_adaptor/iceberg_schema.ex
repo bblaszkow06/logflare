@@ -10,10 +10,14 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.IcebergSchema do
   separator require the identifier to be quoted, e.g. DuckDB needs
   `"events.timestamp"`.
 
-  Only `id` and `timestamp` are required. Each table is stamped with a
-  `logflare.schema-version` property (see `table_properties/1`) — a hash of
-  the table's field definitions — so provisioning runs can detect schema
-  drift against live tables.
+  All sources of a backend share these three tables, so `project` and
+  `source_uuid` carry the tenancy of every row and are required alongside `id`
+  and `timestamp`. The mapper always emits both (`""` when the event body has
+  no project path), so the NOT NULL contract holds for any event.
+
+  Each table is stamped with a `logflare.schema-version` property (see
+  `table_properties/1`) — a hash of the table's field definitions — so
+  provisioning runs can detect schema drift against live tables.
   """
 
   alias Logflare.LogEvent.TypeDetection
@@ -27,9 +31,9 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.IcebergSchema do
   @event_types [:log, :metric, :trace]
   @log_fields [
     %{name: "id", type: "string", required: true},
-    %{name: "source_uuid", type: "string", required: false},
+    %{name: "source_uuid", type: "string", required: true},
     %{name: "source_name", type: "string", required: false},
-    %{name: "project", type: "string", required: false},
+    %{name: "project", type: "string", required: true},
     %{name: "trace_id", type: "string", required: false},
     %{name: "span_id", type: "string", required: false},
     %{name: "trace_flags", type: "int", required: false},
@@ -51,9 +55,9 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.IcebergSchema do
 
   @metric_fields [
     %{name: "id", type: "string", required: true},
-    %{name: "source_uuid", type: "string", required: false},
+    %{name: "source_uuid", type: "string", required: true},
     %{name: "source_name", type: "string", required: false},
-    %{name: "project", type: "string", required: false},
+    %{name: "project", type: "string", required: true},
     %{name: "time_unix", type: "timestamptz", required: false},
     %{name: "start_time_unix", type: "timestamptz", required: false},
     %{name: "metric_name", type: "string", required: false},
@@ -99,9 +103,9 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.IcebergSchema do
 
   @trace_fields [
     %{name: "id", type: "string", required: true},
-    %{name: "source_uuid", type: "string", required: false},
+    %{name: "source_uuid", type: "string", required: true},
     %{name: "source_name", type: "string", required: false},
-    %{name: "project", type: "string", required: false},
+    %{name: "project", type: "string", required: true},
     %{name: "trace_id", type: "string", required: false},
     %{name: "span_id", type: "string", required: false},
     %{name: "parent_span_id", type: "string", required: false},
