@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use arrow_array::RecordBatch;
 use arrow_json::ReaderBuilder;
+use arrow_select::concat::concat_batches;
 use iceberg::arrow::{schema_to_arrow_schema, RecordBatchPartitionSplitter};
 use iceberg::spec::DataFileFormat;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -26,6 +28,7 @@ use uuid::Uuid;
 
 mod layout;
 mod schema;
+mod sort;
 
 use layout::LayoutSpec;
 use schema::FieldSpec;
@@ -350,12 +353,17 @@ impl Encoder for AppendError {
     }
 }
 
-/// Decodes newline-delimited JSON rows into Arrow record batches and streams
+/// Decodes newline-delimited JSON rows into Arrow record batches and writes
 /// them into one Iceberg parquet data file per day partition (callers batch
 /// per day, so normally exactly one), then commits a fast-append
 /// transaction. Commit conflicts are retried by the iceberg crate itself
 /// (bounded by the `commit.retry.*` table properties); exhaustion surfaces
 /// as `{:error, :commit_conflict}`.
+///
+/// Row order: rows are reordered to the table's declared sort order before
+/// being written, and the files advertise that order in their parquet footer,
+/// so a reader can prune on the leading sort columns. Tables created without
+/// a sort order keep arrival order.
 ///
 /// Contract: integer values in `timestamptz` columns are unix
 /// **microseconds** (the unit the mapper emits for NDJSON output and that
@@ -396,7 +404,21 @@ async fn do_append(
         table.metadata().default_partition_spec().clone(),
     )?;
 
-    let parquet_builder = ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema);
+    let sort_fields = sort::resolve(
+        table.metadata().default_sort_order(),
+        &iceberg_schema,
+        &arrow_schema,
+    )
+    .map_err(AppendError::Other)?;
+
+    let writer_properties = match sort_fields.as_slice() {
+        [] => WriterProperties::default(),
+        fields => WriterProperties::builder()
+            .set_sorting_columns(Some(sort::sorting_columns(fields)))
+            .build(),
+    };
+
+    let parquet_builder = ParquetWriterBuilder::new(writer_properties, iceberg_schema);
     let location_generator = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(
         "part".to_string(),
@@ -414,22 +436,18 @@ async fn do_append(
     // so successive batches of the same partition stream into the same file
     let mut writer = FanoutWriter::new(DataFileWriterBuilder::new(rolling_builder));
 
-    let mut decoder = ReaderBuilder::new(arrow_schema)
+    let mut decoder = ReaderBuilder::new(arrow_schema.clone())
         .with_batch_size(DECODER_BATCH_SIZE)
         .build_decoder()?;
 
-    let mut row_count: u64 = 0;
+    let mut decoded: Vec<RecordBatch> = Vec::new();
     let mut pos = 0;
 
     loop {
         // decode stops once a full batch is buffered, so drain before
         // decoding further
         while let Some(batch) = decoder.flush()? {
-            row_count += batch.num_rows() as u64;
-
-            for (partition_key, partition_batch) in splitter.split(&batch)? {
-                writer.write(partition_key, partition_batch).await?;
-            }
+            decoded.push(batch);
         }
 
         if pos >= ndjson.len() {
@@ -443,6 +461,26 @@ async fn do_append(
         }
 
         pos += read;
+    }
+
+    // sorting is global over the append, so the whole payload has to be
+    // materialised first; callers cap a batch at BatchSplitter's limits
+    let batches = match sort_fields.as_slice() {
+        [] => decoded,
+        fields => vec![sort::sort_batch(
+            &concat_batches(&arrow_schema, &decoded)?,
+            fields,
+        )?],
+    };
+
+    let mut row_count: u64 = 0;
+
+    for batch in &batches {
+        row_count += batch.num_rows() as u64;
+
+        for (partition_key, partition_batch) in splitter.split(batch)? {
+            writer.write(partition_key, partition_batch).await?;
+        }
     }
 
     if row_count == 0 {
