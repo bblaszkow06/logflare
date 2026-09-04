@@ -5,7 +5,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.Native.Nifs do
 
   def init_catalog(_ref, _config), do: :erlang.nif_error(:nif_not_loaded)
 
-  def ensure_table(_ref, _catalog, _table_name, _fields, _properties),
+  def ensure_table(_ref, _catalog, _table_name, _fields, _layout, _properties),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def table_info(_ref, _catalog, _table_name), do: :erlang.nif_error(:nif_not_loaded)

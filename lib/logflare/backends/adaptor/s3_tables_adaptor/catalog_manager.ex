@@ -85,9 +85,10 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.CatalogManager do
     Enum.reduce_while(IcebergSchema.event_types(), :ok, fn event_type, :ok ->
       table_name = IcebergSchema.table_name(event_type)
       fields = IcebergSchema.fields(event_type)
+      layout = IcebergSchema.layout(event_type)
       properties = IcebergSchema.table_properties(event_type)
 
-      case Native.ensure_table(catalog, table_name, fields, properties) do
+      case Native.ensure_table(catalog, table_name, fields, layout, properties) do
         {:ok, :created} ->
           {:cont, :ok}
 
@@ -137,6 +138,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.CatalogManager do
   defp check_version(info, event_type) do
     expected_version = IcebergSchema.schema_version(event_type)
     expected_columns = Enum.map(IcebergSchema.fields(event_type), & &1.name)
+    layout = IcebergSchema.layout(event_type)
     stored_version = info.properties["logflare.schema-version"]
 
     if stored_version == expected_version do
@@ -144,7 +146,11 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.CatalogManager do
     else
       error_meta = [
         missing_columns: expected_columns -- info.columns,
-        extra_columns: info.columns -- expected_columns
+        extra_columns: info.columns -- expected_columns,
+        expected_sort_order: Enum.map(layout.sort_order, & &1.field),
+        actual_sort_order: info.sort_order,
+        expected_partition: Enum.map(layout.partition, & &1.name),
+        actual_partition: info.partition
       ]
 
       {:error, :version_mismatch, error_meta}

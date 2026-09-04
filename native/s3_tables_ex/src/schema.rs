@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use iceberg::spec::{ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema, Type};
@@ -15,20 +16,18 @@ pub struct FieldSpec {
 /// IDs. `TableMetadataBuilder::from_table_creation` reassigns all field IDs on create, so
 /// these only need to be unique within the schema being built here.
 ///
-/// Returns the schema along with the field ID of the required `timestamp` column, used to
-/// build the day-partition spec.
-pub fn build(fields: &[FieldSpec]) -> Result<(Schema, i32), String> {
+/// Returns the schema along with the top-level column name → field ID map, used to resolve
+/// the layout's partition and sort columns.
+pub fn build(fields: &[FieldSpec]) -> Result<(Schema, HashMap<String, i32>), String> {
     let mut next_id = 0;
     let mut nested_fields: Vec<NestedFieldRef> = Vec::with_capacity(fields.len());
-    let mut timestamp_field_id = None;
+    let mut field_ids = HashMap::with_capacity(fields.len());
 
     for field in fields {
         let id = allocate_id(&mut next_id);
         let field_type = parse_type(&field.r#type, &mut next_id)?;
 
-        if field.name == "timestamp" {
-            timestamp_field_id = Some(id);
-        }
+        field_ids.insert(field.name.clone(), id);
 
         let nested = if field.required {
             NestedField::required(id, &field.name, field_type)
@@ -39,15 +38,12 @@ pub fn build(fields: &[FieldSpec]) -> Result<(Schema, i32), String> {
         nested_fields.push(Arc::new(nested));
     }
 
-    let timestamp_field_id = timestamp_field_id
-        .ok_or_else(|| "schema is missing a required \"timestamp\" field".to_string())?;
-
     let schema = Schema::builder()
         .with_fields(nested_fields)
         .build()
         .map_err(|err| format!("{err:?}"))?;
 
-    Ok((schema, timestamp_field_id))
+    Ok((schema, field_ids))
 }
 
 fn allocate_id(next_id: &mut i32) -> i32 {
