@@ -23,15 +23,21 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.Native do
     |> wrap_sending_nif()
   end
 
-  @spec ensure_table(reference(), String.t(), [map()], %{String.t() => String.t()}) ::
+  @spec ensure_table(reference(), String.t(), [map()], map(), %{String.t() => String.t()}) ::
           {:ok, :created | :already_exists} | {:error, String.t()}
-  def ensure_table(catalog, table_name, fields, properties) do
-    fn ref -> Nifs.ensure_table(ref, catalog, table_name, fields, properties) end
+  def ensure_table(catalog, table_name, fields, layout, properties) do
+    fn ref -> Nifs.ensure_table(ref, catalog, table_name, fields, layout, properties) end
     |> wrap_sending_nif()
   end
 
   @spec table_info(reference(), String.t()) ::
-          {:ok, %{columns: [String.t()], properties: %{String.t() => String.t()}}}
+          {:ok,
+           %{
+             columns: [String.t()],
+             partition: [String.t()],
+             sort_order: [String.t()],
+             properties: %{String.t() => String.t()}
+           }}
           | {:error, String.t()}
   def table_info(catalog, table_name) do
     fn ref -> Nifs.table_info(ref, catalog, table_name) end

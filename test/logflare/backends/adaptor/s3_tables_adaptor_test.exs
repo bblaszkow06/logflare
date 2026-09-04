@@ -66,7 +66,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
       catalog = make_ref()
       Mimic.stub(Native, :init_catalog, fn _config -> {:ok, catalog} end)
 
-      Mimic.stub(Native, :ensure_table, fn _catalog, _table, _fields, _props ->
+      Mimic.stub(Native, :ensure_table, fn _catalog, _table, _fields, _layout, _props ->
         {:ok, :created}
       end)
 
@@ -253,6 +253,12 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
                S3TablesMockServer.tables(server)
 
       assert {:ok, catalog} = CatalogManager.fetch_catalog(backend_id)
+
+      assert {:ok, %{partition: ["timestamp_day"], sort_order: sort_order}} =
+               Native.table_info(catalog, "otel_logs")
+
+      assert sort_order == ["project", "source_uuid", "timestamp"]
+
       assert {:ok, snapshot} = Native.snapshot_info(catalog, "otel_logs")
       assert snapshot.operation == "append"
       assert snapshot.summary["added-records"] == "1"
@@ -307,22 +313,37 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
       %{config: config}
     end
 
-    test "ensure_table/4 and table_info/2", %{config: config} do
+    test "ensure_table/5 and table_info/2", %{config: config} do
       assert {:ok, catalog} = S3TablesAdaptor.Native.init_catalog(config)
 
       for event_type <- IcebergSchema.event_types() do
         table_name = IcebergSchema.table_name(event_type)
         fields = IcebergSchema.fields(event_type)
+        layout = IcebergSchema.layout(event_type)
         properties = IcebergSchema.table_properties(event_type)
 
         assert {:ok, _status} =
-                 S3TablesAdaptor.Native.ensure_table(catalog, table_name, fields, properties)
+                 S3TablesAdaptor.Native.ensure_table(
+                   catalog,
+                   table_name,
+                   fields,
+                   layout,
+                   properties
+                 )
 
         assert {:ok, :already_exists} =
-                 S3TablesAdaptor.Native.ensure_table(catalog, table_name, fields, properties)
+                 S3TablesAdaptor.Native.ensure_table(
+                   catalog,
+                   table_name,
+                   fields,
+                   layout,
+                   properties
+                 )
 
         assert {:ok, info} = S3TablesAdaptor.Native.table_info(catalog, table_name)
         assert info.columns == Enum.map(fields, & &1.name)
+        assert info.partition == Enum.map(layout.partition, & &1.name)
+        assert info.sort_order == Enum.map(layout.sort_order, & &1.field)
 
         assert info.properties["logflare.schema-version"] ==
                  IcebergSchema.schema_version(event_type)
@@ -338,6 +359,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
                  catalog,
                  table_name,
                  IcebergSchema.fields(:log),
+                 IcebergSchema.layout(:log),
                  IcebergSchema.table_properties(:log)
                )
 
@@ -378,6 +400,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
                  catalog,
                  table_name,
                  IcebergSchema.fields(:log),
+                 IcebergSchema.layout(:log),
                  IcebergSchema.table_properties(:log)
                )
 
