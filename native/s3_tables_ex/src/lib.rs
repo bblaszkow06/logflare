@@ -370,7 +370,7 @@ async fn do_append(
     )?;
 
     let parquet_builder = ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema);
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_generator = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(
         "part".to_string(),
         Some(Uuid::new_v4().to_string()),
