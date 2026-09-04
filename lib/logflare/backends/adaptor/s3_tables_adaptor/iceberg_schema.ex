@@ -21,7 +21,14 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.IcebergSchema do
 
   Each table is stamped with a `logflare.schema-version` property (see
   `table_properties/1`) — a hash of the table's field definitions *and*
-  layout — so provisioning runs can detect drift against live tables.
+  layout — so provisioning runs can detect drift against live tables. Drift is
+  only warned about; changing anything here means existing tables must be
+  dropped and recreated (see `S3TablesAdaptor.CatalogManager`).
+
+  Sorted files only stay clustered through S3 Tables' managed compaction if the
+  table's maintenance config sets `compaction.strategy = sort` — an AWS
+  maintenance API setting, not Iceberg metadata, and not managed here. Under
+  the default `binpack` strategy compaction may interleave rows again.
   """
 
   alias Logflare.LogEvent.TypeDetection

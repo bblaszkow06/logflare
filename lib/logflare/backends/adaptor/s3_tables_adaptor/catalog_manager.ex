@@ -3,8 +3,14 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.CatalogManager do
   Permanent per-backend process that provisions the S3 Tables catalog and Iceberg tables on
   boot, then caches the resulting catalog resource for lock-free hot-path reads.
 
-  For existing tables, provisioning compares the live column names against `IcebergSchema` and
-  logs a warning on drift.
+  For existing tables, provisioning compares the stored `logflare.schema-version` against
+  `IcebergSchema` and logs a warning on drift, reporting the column and layout differences.
+
+  Drift is only reported, never repaired: Iceberg cannot promote an optional column to
+  required, and neither iceberg-rust nor S3 Tables supports partition-spec evolution, so a
+  table created under an older version has to be dropped and recreated
+  (`Native.drop_table/2`, then restart the backend to re-provision). Ingestion into a drifted
+  table keeps working with that table's own layout.
   """
 
   use GenServer
