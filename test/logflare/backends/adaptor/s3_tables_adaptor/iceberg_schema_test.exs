@@ -10,7 +10,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.IcebergSchemaTest do
     list<long> list<double> list<string> list<timestamptz> list<map<string,string>>
   )
 
-  @required_field_names ~w(id timestamp)
+  @required_field_names ~w(id source_uuid project timestamp)
 
   test "fields/1" do
     for event_type <- IcebergSchema.event_types() do

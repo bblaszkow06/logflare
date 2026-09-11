@@ -60,6 +60,10 @@ defmodule Logflare.S3TablesMockServer do
   @spec object_keys(server()) :: [String.t()]
   def object_keys(%{agent: agent}), do: Agent.get(agent, &Map.keys(&1.objects))
 
+  @doc "Returns the body of a stored S3 object, or `nil` when the key is unknown."
+  @spec object(server(), String.t()) :: binary() | nil
+  def object(%{agent: agent}, key), do: Agent.get(agent, &Map.get(&1.objects, key))
+
   @impl Plug
   def init(opts), do: opts
 

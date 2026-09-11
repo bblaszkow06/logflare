@@ -3,8 +3,14 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.CatalogManager do
   Permanent per-backend process that provisions the S3 Tables catalog and Iceberg tables on
   boot, then caches the resulting catalog resource for lock-free hot-path reads.
 
-  For existing tables, provisioning compares the live column names against `IcebergSchema` and
-  logs a warning on drift.
+  For existing tables, provisioning compares the stored `logflare.schema-version` against
+  `IcebergSchema` and logs a warning on drift, reporting the column and layout differences.
+
+  Drift is only reported, never repaired: Iceberg cannot promote an optional column to
+  required, and neither iceberg-rust nor S3 Tables supports partition-spec evolution, so a
+  table created under an older version has to be dropped and recreated
+  (`Native.drop_table/2`, then restart the backend to re-provision). Ingestion into a drifted
+  table keeps working with that table's own layout.
   """
 
   use GenServer
@@ -85,9 +91,10 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.CatalogManager do
     Enum.reduce_while(IcebergSchema.event_types(), :ok, fn event_type, :ok ->
       table_name = IcebergSchema.table_name(event_type)
       fields = IcebergSchema.fields(event_type)
+      layout = IcebergSchema.layout(event_type)
       properties = IcebergSchema.table_properties(event_type)
 
-      case Native.ensure_table(catalog, table_name, fields, properties) do
+      case Native.ensure_table(catalog, table_name, fields, layout, properties) do
         {:ok, :created} ->
           {:cont, :ok}
 
@@ -137,6 +144,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.CatalogManager do
   defp check_version(info, event_type) do
     expected_version = IcebergSchema.schema_version(event_type)
     expected_columns = Enum.map(IcebergSchema.fields(event_type), & &1.name)
+    layout = IcebergSchema.layout(event_type)
     stored_version = info.properties["logflare.schema-version"]
 
     if stored_version == expected_version do
@@ -144,7 +152,11 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.CatalogManager do
     else
       error_meta = [
         missing_columns: expected_columns -- info.columns,
-        extra_columns: info.columns -- expected_columns
+        extra_columns: info.columns -- expected_columns,
+        expected_sort_order: Enum.map(layout.sort_order, & &1.field),
+        actual_sort_order: info.sort_order,
+        expected_partition: Enum.map(layout.partition, & &1.name),
+        actual_partition: info.partition
       ]
 
       {:error, :version_mismatch, error_meta}

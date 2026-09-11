@@ -66,7 +66,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
       catalog = make_ref()
       Mimic.stub(Native, :init_catalog, fn _config -> {:ok, catalog} end)
 
-      Mimic.stub(Native, :ensure_table, fn _catalog, _table, _fields, _props ->
+      Mimic.stub(Native, :ensure_table, fn _catalog, _table, _fields, _layout, _props ->
         {:ok, :created}
       end)
 
@@ -211,11 +211,12 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
       insert(:plan)
       user = insert(:user)
       source = insert(:source, user: user)
+      other_source = insert(:source, user: user)
 
       backend =
         insert(:backend,
           type: :s3_tables,
-          sources: [source],
+          sources: [source, other_source],
           user: user,
           config: %{
             table_bucket_arn: "arn:aws:s3tables:us-east-1:000000000000:bucket/mock-bucket",
@@ -232,7 +233,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
       start_supervised!({S3TablesAdaptor, backend})
       start_supervised!({CatalogManager, backend})
 
-      [source: source, backend: backend, server: server]
+      [source: source, other_source: other_source, backend: backend, server: server]
     end
 
     test "log event", %{source: source, backend: backend, server: server} do
@@ -253,6 +254,12 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
                S3TablesMockServer.tables(server)
 
       assert {:ok, catalog} = CatalogManager.fetch_catalog(backend_id)
+
+      assert {:ok, %{partition: ["timestamp_day"], sort_order: sort_order}} =
+               Native.table_info(catalog, "otel_logs")
+
+      assert sort_order == ["project", "source_uuid", "timestamp"]
+
       assert {:ok, snapshot} = Native.snapshot_info(catalog, "otel_logs")
       assert snapshot.operation == "append"
       assert snapshot.summary["added-records"] == "1"
@@ -262,6 +269,77 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
                &String.ends_with?(&1, ".parquet")
              )
     end
+
+    @tag :tmp_dir
+    test "batch of two sources and two projects in arrival order", %{
+      source: source,
+      other_source: other_source,
+      backend: backend,
+      server: server,
+      tmp_dir: tmp_dir
+    } do
+      backend_id = backend.id
+      noon = DateTime.new!(Date.utc_today(), ~T[12:00:00Z])
+
+      # arrival order deliberately matches neither project, source nor time
+      arrivals = [
+        {other_source, "proj-b", 0},
+        {source, "proj-b", 5},
+        {source, "proj-a", 4},
+        {other_source, "proj-a", 3},
+        {source, "proj-a", 1},
+        {other_source, "proj-b", 2}
+      ]
+
+      :telemetry_test.attach_event_handlers(self(), [
+        [:logflare, :backends, :s3_tables, :append]
+      ])
+
+      for {ingest_source, events} <- Enum.group_by(arrivals, &elem(&1, 0)) do
+        events =
+          for {_source, project, second} <- events do
+            %{
+              "event_message" => "#{project} at #{second}",
+              "project" => project,
+              "timestamp" => DateTime.to_iso8601(DateTime.add(noon, second))
+            }
+          end
+
+        assert {:ok, _} = Backends.ingest_logs(events, ingest_source)
+      end
+
+      assert_receive {[:logflare, :backends, :s3_tables, :append], _ref,
+                      %{row_count: 6, data_files: 1}, %{status: :ok, backend_id: ^backend_id}},
+                     30_000
+
+      # the sort key includes source_uuid, whose values are only known now
+      expected =
+        for {row_source, project, second} <-
+              Enum.sort_by(arrivals, fn {row_source, project, second} ->
+                {project, to_string(row_source.token), second}
+              end),
+            do: {project, to_string(row_source.token), "#{project} at #{second}"}
+
+      df = read_parquet(server, tmp_dir, ~w(project source_uuid event_message))
+
+      assert Enum.zip([
+               Explorer.Series.to_list(df["project"]),
+               Explorer.Series.to_list(df["source_uuid"]),
+               Explorer.Series.to_list(df["event_message"])
+             ]) == expected
+    end
+  end
+
+  defp read_parquet(server, tmp_dir, columns) do
+    assert [key] =
+             server
+             |> S3TablesMockServer.object_keys()
+             |> Enum.filter(&String.ends_with?(&1, ".parquet"))
+
+    path = Path.join(tmp_dir, "data.parquet")
+    File.write!(path, S3TablesMockServer.object(server, key))
+
+    Explorer.DataFrame.from_parquet!(path, columns: columns)
   end
 
   defp decode_ndjson(ndjson) do
@@ -307,22 +385,37 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
       %{config: config}
     end
 
-    test "ensure_table/4 and table_info/2", %{config: config} do
+    test "ensure_table/5 and table_info/2", %{config: config} do
       assert {:ok, catalog} = S3TablesAdaptor.Native.init_catalog(config)
 
       for event_type <- IcebergSchema.event_types() do
         table_name = IcebergSchema.table_name(event_type)
         fields = IcebergSchema.fields(event_type)
+        layout = IcebergSchema.layout(event_type)
         properties = IcebergSchema.table_properties(event_type)
 
         assert {:ok, _status} =
-                 S3TablesAdaptor.Native.ensure_table(catalog, table_name, fields, properties)
+                 S3TablesAdaptor.Native.ensure_table(
+                   catalog,
+                   table_name,
+                   fields,
+                   layout,
+                   properties
+                 )
 
         assert {:ok, :already_exists} =
-                 S3TablesAdaptor.Native.ensure_table(catalog, table_name, fields, properties)
+                 S3TablesAdaptor.Native.ensure_table(
+                   catalog,
+                   table_name,
+                   fields,
+                   layout,
+                   properties
+                 )
 
         assert {:ok, info} = S3TablesAdaptor.Native.table_info(catalog, table_name)
         assert info.columns == Enum.map(fields, & &1.name)
+        assert info.partition == Enum.map(layout.partition, & &1.name)
+        assert info.sort_order == Enum.map(layout.sort_order, & &1.field)
 
         assert info.properties["logflare.schema-version"] ==
                  IcebergSchema.schema_version(event_type)
@@ -338,6 +431,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
                  catalog,
                  table_name,
                  IcebergSchema.fields(:log),
+                 IcebergSchema.layout(:log),
                  IcebergSchema.table_properties(:log)
                )
 
@@ -378,6 +472,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
                  catalog,
                  table_name,
                  IcebergSchema.fields(:log),
+                 IcebergSchema.layout(:log),
                  IcebergSchema.table_properties(:log)
                )
 

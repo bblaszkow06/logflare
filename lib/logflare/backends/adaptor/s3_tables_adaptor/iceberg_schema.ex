@@ -10,10 +10,25 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.IcebergSchema do
   separator require the identifier to be quoted, e.g. DuckDB needs
   `"events.timestamp"`.
 
-  Only `id` and `timestamp` are required. Each table is stamped with a
-  `logflare.schema-version` property (see `table_properties/1`) — a hash of
-  the table's field definitions — so provisioning runs can detect schema
-  drift against live tables.
+  All sources of a backend share these three tables, so `project` and
+  `source_uuid` carry the tenancy of every row and are required alongside `id`
+  and `timestamp`. The mapper always emits both (`""` when the event body has
+  no project path), so the NOT NULL contract holds for any event.
+
+  Rows are partitioned by day and clustered by `(project, source_uuid,
+  timestamp)`, so a tenant query (`WHERE project = $1 [AND source_uuid = $2]`)
+  reads only the files whose parquet ranges cover that tenant.
+
+  Each table is stamped with a `logflare.schema-version` property (see
+  `table_properties/1`) — a hash of the table's field definitions *and*
+  layout — so provisioning runs can detect drift against live tables. Drift is
+  only warned about; changing anything here means existing tables must be
+  dropped and recreated (see `S3TablesAdaptor.CatalogManager`).
+
+  Sorted files only stay clustered through S3 Tables' managed compaction if the
+  table's maintenance config sets `compaction.strategy = sort` — an AWS
+  maintenance API setting, not Iceberg metadata, and not managed here. Under
+  the default `binpack` strategy compaction may interleave rows again.
   """
 
   alias Logflare.LogEvent.TypeDetection
@@ -23,13 +38,25 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.IcebergSchema do
   @commit_retry_total_timeout_ms "30000"
 
   @type field :: %{name: String.t(), type: String.t(), required: boolean()}
+  @type partition_field :: %{field: String.t(), transform: String.t(), name: String.t()}
+  @type sort_field :: %{field: String.t(), direction: String.t(), null_order: String.t()}
+  @type layout :: %{partition: [partition_field()], sort_order: [sort_field()]}
+
+  @layout %{
+    partition: [%{field: "timestamp", transform: "day", name: "timestamp_day"}],
+    sort_order: [
+      %{field: "project", direction: "asc", null_order: "first"},
+      %{field: "source_uuid", direction: "asc", null_order: "first"},
+      %{field: "timestamp", direction: "asc", null_order: "first"}
+    ]
+  }
 
   @event_types [:log, :metric, :trace]
   @log_fields [
     %{name: "id", type: "string", required: true},
-    %{name: "source_uuid", type: "string", required: false},
+    %{name: "source_uuid", type: "string", required: true},
     %{name: "source_name", type: "string", required: false},
-    %{name: "project", type: "string", required: false},
+    %{name: "project", type: "string", required: true},
     %{name: "trace_id", type: "string", required: false},
     %{name: "span_id", type: "string", required: false},
     %{name: "trace_flags", type: "int", required: false},
@@ -51,9 +78,9 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.IcebergSchema do
 
   @metric_fields [
     %{name: "id", type: "string", required: true},
-    %{name: "source_uuid", type: "string", required: false},
+    %{name: "source_uuid", type: "string", required: true},
     %{name: "source_name", type: "string", required: false},
-    %{name: "project", type: "string", required: false},
+    %{name: "project", type: "string", required: true},
     %{name: "time_unix", type: "timestamptz", required: false},
     %{name: "start_time_unix", type: "timestamptz", required: false},
     %{name: "metric_name", type: "string", required: false},
@@ -99,9 +126,9 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.IcebergSchema do
 
   @trace_fields [
     %{name: "id", type: "string", required: true},
-    %{name: "source_uuid", type: "string", required: false},
+    %{name: "source_uuid", type: "string", required: true},
     %{name: "source_name", type: "string", required: false},
-    %{name: "project", type: "string", required: false},
+    %{name: "project", type: "string", required: true},
     %{name: "trace_id", type: "string", required: false},
     %{name: "span_id", type: "string", required: false},
     %{name: "parent_span_id", type: "string", required: false},
@@ -151,22 +178,47 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.IcebergSchema do
   def fields(:metric), do: @metric_fields
   def fields(:trace), do: @trace_fields
 
-  # Calculate schema version at compile time
+  @doc """
+  Returns the physical layout — partition spec and sort order — applied to a
+  given event type's table at creation.
+  """
+  @spec layout(TypeDetection.event_type()) :: layout()
+  def layout(event_type) when event_type in @event_types, do: @layout
+
+  # Calculate schema version at compile time, raising if the layout references
+  # a column the table does not have
   defmacrop schema_version_m(event_type) when is_atom(event_type) do
-    canonical =
-      event_type
-      |> case do
+    fields =
+      case event_type do
         :log -> @log_fields
         :metric -> @metric_fields
         :trace -> @trace_fields
       end
-      |> Enum.map_join("\n", fn %{name: name, type: type, required: required} ->
+
+    field_names = Enum.map(fields, & &1.name)
+
+    for %{field: name} <- @layout.partition ++ @layout.sort_order, name not in field_names do
+      raise "#{event_type} table layout references unknown column #{inspect(name)}"
+    end
+
+    field_lines =
+      Enum.map(fields, fn %{name: name, type: type, required: required} ->
         "#{name}:#{type}:#{required}"
+      end)
+
+    partition_lines =
+      Enum.map(@layout.partition, fn %{field: field, transform: transform, name: name} ->
+        "partition:#{field}:#{transform}:#{name}"
+      end)
+
+    sort_lines =
+      Enum.map(@layout.sort_order, fn %{field: field, direction: dir, null_order: null_order} ->
+        "sort:#{field}:#{dir}:#{null_order}"
       end)
 
     version =
       :sha256
-      |> :crypto.hash(canonical)
+      |> :crypto.hash(Enum.join(field_lines ++ partition_lines ++ sort_lines, "\n"))
       |> Base.encode16(case: :lower)
 
     quote do
@@ -176,7 +228,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.IcebergSchema do
 
   @doc """
   Returns the schema version for a given event type's table: a SHA-256 hash
-  of the canonical field definitions.
+  of the canonical field definitions and layout.
   """
   @spec schema_version(TypeDetection.event_type()) :: String.t()
   def schema_version(:log), do: schema_version_m(:log)
