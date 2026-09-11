@@ -71,12 +71,17 @@ fn fmt_err<E: std::fmt::Debug>(err: E) -> String {
     format!("{err:?}")
 }
 
+/// `endpoint_url` and `s3_endpoint` override the AWS S3 Tables API and S3
+/// object-store endpoints respectively (used by tests to point the catalog at
+/// a local mock server, or at LocalStack).
 #[derive(Debug, NifMap)]
 struct Config {
     table_bucket_arn: String,
     access_key_id: String,
     secret_access_key: String,
     namespace: String,
+    endpoint_url: Option<String>,
+    s3_endpoint: Option<String>,
 }
 
 fn runtime() -> &'static Runtime {
@@ -115,11 +120,32 @@ fn init_catalog<'a>(env: Env<'a>, result_tag: Term<'a>, config: Config) -> NifAt
     let mut props = HashMap::new();
 
     if !config.access_key_id.is_empty() && !config.secret_access_key.is_empty() {
-        props.insert("aws_access_key_id".to_string(), config.access_key_id);
+        // aws_* keys configure the S3 Tables SDK client, s3.* keys the FileIO
+        // (opendal) side that reads/writes metadata and data files
+        props.insert(
+            "aws_access_key_id".to_string(),
+            config.access_key_id.clone(),
+        );
         props.insert(
             "aws_secret_access_key".to_string(),
-            config.secret_access_key,
+            config.secret_access_key.clone(),
         );
+        props.insert("s3.access-key-id".to_string(), config.access_key_id);
+        props.insert("s3.secret-access-key".to_string(), config.secret_access_key);
+    }
+
+    if let Some(endpoint_url) = config.endpoint_url {
+        props.insert("endpoint_url".to_string(), endpoint_url);
+        // a custom endpoint has no AWS environment to resolve a region from
+        props.insert("region_name".to_string(), "us-east-1".to_string());
+    }
+
+    if let Some(s3_endpoint) = config.s3_endpoint {
+        props.insert("s3.endpoint".to_string(), s3_endpoint);
+        props.insert("s3.path-style-access".to_string(), "true".to_string());
+        props.insert("s3.region".to_string(), "us-east-1".to_string());
+        props.insert("s3.disable-ec2-metadata".to_string(), "true".to_string());
+        props.insert("s3.disable-config-load".to_string(), "true".to_string());
     }
 
     spawn_reply(env, result_tag, async move {
