@@ -131,6 +131,7 @@ defmodule LogflareWeb.Endpoints.Components do
 
   defp format_language(:bq_sql), do: "BigQuery SQL"
   defp format_language(:ch_sql), do: "ClickHouse SQL"
+  defp format_language(:duckdb_sql), do: "DuckDB SQL"
   defp format_language(:pg_sql), do: "Postgres SQL"
   defp format_language(:lql), do: "Logflare Query Language"
   defp format_language(language), do: language |> to_string() |> Phoenix.Naming.humanize()
@@ -147,5 +148,5 @@ defmodule LogflareWeb.Endpoints.Components do
 
   defp format_label(field), do: @field_labels[field] || Phoenix.Naming.humanize(field)
 
-  defp sql_query?(%{language: language}), do: language in [:bq_sql, :ch_sql, :pg_sql]
+  defp sql_query?(%{language: language}), do: language in [:bq_sql, :ch_sql, :duckdb_sql, :pg_sql]
 end

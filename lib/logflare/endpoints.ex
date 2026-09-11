@@ -31,9 +31,10 @@ defmodule Logflare.Endpoints do
   alias Logflare.Utils
   alias PaperTrail.Version
 
-  @valid_sql_languages ~w(bq_sql ch_sql pg_sql)a
+  @valid_sql_languages ~w(bq_sql ch_sql duckdb_sql pg_sql)a
 
-  @typep language :: :bq_sql | :ch_sql | :pg_sql | :lql
+  @typep sql_language :: :bq_sql | :ch_sql | :duckdb_sql | :pg_sql
+  @typep language :: sql_language() | :lql
   @typep origin :: User.t() | TeamUser.t() | OauthAccessToken.t()
   @typep run_query_return ::
            {:ok, %{required(:rows) => [term()], optional(atom()) => any()}}
@@ -214,7 +215,7 @@ defmodule Logflare.Endpoints do
 
   Returns `:bq_sql` if no backend ID is specified or if the backend ID is invalid.
   """
-  @spec derive_language_from_backend_id(String.t() | integer() | nil) :: atom()
+  @spec derive_language_from_backend_id(String.t() | integer() | nil) :: language()
   def derive_language_from_backend_id(backend_id) when is_non_empty_binary(backend_id) do
     case Integer.parse(backend_id) do
       {id, ""} -> derive_language_from_backend_id(id)
@@ -440,7 +441,7 @@ defmodule Logflare.Endpoints do
   Parses a query string without running it.
   """
   @spec parse_query_string(
-          language :: :bq_sql | :ch_sql | :pg_sql,
+          language :: sql_language(),
           query_string :: String.t(),
           endpoint_queries :: [EndpointQuery.t()],
           alerts :: [AlertQuery.t()]
@@ -750,12 +751,13 @@ defmodule Logflare.Endpoints do
           lql_param :: String.t() | nil,
           sql_param :: String.t() | nil,
           expanded_query :: String.t(),
-          language :: :bq_sql | :ch_sql | :pg_sql,
+          language :: sql_language(),
           sandboxable :: boolean()
         ) :: {:ok, String.t() | nil} | {:error, String.t()}
   # no sql_param provided, but lql_param is present for SANDBOXED endpoint
   defp maybe_convert_lql_to_sql(lql_param, nil, expanded_query, language, true)
-       when is_non_empty_binary(lql_param) and language in [:bq_sql, :ch_sql, :pg_sql] do
+       when is_non_empty_binary(lql_param) and
+              language in @valid_sql_languages do
     with {:ok, cte_names} <- Sql.extract_cte_aliases(expanded_query),
          {:ok, lql_rules} <- Lql.Parser.parse(lql_param),
          from_rule <- Rules.get_from_rule(lql_rules),
@@ -903,6 +905,7 @@ defmodule Logflare.Endpoints do
   defp language_to_backend_type(:pg_sql), do: :postgres
   defp language_to_backend_type(:ch_sql), do: :clickhouse
   defp language_to_backend_type(:bq_sql), do: :bigquery
+  defp language_to_backend_type(:duckdb_sql), do: :s3_tables
   defp language_to_backend_type(_), do: nil
 
   @spec find_backend_by_type_or_default(user_id :: integer(), backend_type :: atom() | nil) ::
