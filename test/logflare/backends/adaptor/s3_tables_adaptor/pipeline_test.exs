@@ -46,6 +46,21 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptor.PipelineTest do
       end
     end
 
+    # source_uuid and project are NOT NULL in the Iceberg tables, so a row
+    # missing either would be rejected by the arrow-json decoder on append
+    test "event body with and without a project path" do
+      for {body, expected_project} <- [{%{}, ""}, {%{"project" => "abcproject"}, "abcproject"}] do
+        event = build(:log_event, body) |> Map.put(:event_type, :log)
+        source_uuid = to_string(event.source_uuid)
+
+        assert %Message{data: {_event, row}} =
+                 Pipeline.handle_message(:default, message(event), context())
+
+        assert %{"project" => ^expected_project, "source_uuid" => ^source_uuid} =
+                 Jason.decode!(row)
+      end
+    end
+
     test "event with non-UTF-8 envelope field" do
       event =
         build(:log_event)
