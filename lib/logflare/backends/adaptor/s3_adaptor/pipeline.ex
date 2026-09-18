@@ -14,15 +14,13 @@ defmodule Logflare.Backends.Adaptor.S3Adaptor.Pipeline do
   alias Logflare.Backends.Adaptor.S3Adaptor
   alias Logflare.Backends.BufferProducer
   alias Logflare.Backends.IngestEventQueue
+  alias Logflare.Backends.Pipeline.BatchSplitter
   alias Logflare.LogEvent
   alias Logflare.Utils
 
   @producer_concurrency 1
   @processor_concurrency 5
 
-  # batch events based on a maximum message count or byte length
-  @max_batch_size 10_000
-  @max_batch_length 8_000_000
   @batcher_max_demand 100
   @max_retries 1
 
@@ -59,7 +57,7 @@ defmodule Logflare.Backends.Adaptor.S3Adaptor.Pipeline do
         batchers: [
           s3: [
             concurrency: 1,
-            batch_size: batch_size_splitter(),
+            batch_size: BatchSplitter.build(),
             max_demand: @batcher_max_demand,
             batch_timeout: batch_timeout
           ]
@@ -148,36 +146,5 @@ defmodule Logflare.Backends.Adaptor.S3Adaptor.Pipeline do
     )
 
     IngestEventQueue.add_to_table({source_id, backend_id}, events)
-  end
-
-  # splits batch sizes based on message body size OR message count, whichever limit is reached first
-  # https://hexdocs.pm/broadway/Broadway.html#start_link/2
-  @spec batch_size_splitter() :: {tuple(), (any(), tuple() -> {:emit | :cont, tuple()})}
-  defp batch_size_splitter do
-    {
-      {@max_batch_size, @max_batch_length},
-      fn
-        # reach max count, emit
-        _message, {1, _len} ->
-          {:emit, {@max_batch_size, @max_batch_length}}
-
-        # check content length
-        message, {count, len} ->
-          length = message_size(message.data.body)
-
-          if len - length <= 0 do
-            # below max batch count, but reach max batch length
-            {:emit, {@max_batch_size, @max_batch_length}}
-          else
-            # below max batch count, below max batch length
-            {:cont, {count - 1, len - length}}
-          end
-      end
-    }
-  end
-
-  @spec message_size(any()) :: non_neg_integer()
-  defp message_size(data) do
-    :erlang.external_size(data)
   end
 end
