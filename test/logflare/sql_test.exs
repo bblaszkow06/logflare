@@ -17,6 +17,8 @@ defmodule Logflare.SqlTest do
   @user_dataset_id "user-dataset-id"
   @env "test"
 
+  doctest Sql, import: true
+
   setup do
     insert(:plan)
     values = Application.get_env(:logflare, Logflare.Google)
@@ -513,6 +515,32 @@ defmodule Logflare.SqlTest do
       assert {:ok, %{1 => "company"}} = Sql.parameter_positions(ch_query, dialect: "clickhouse")
     end
 
+    test "map_query_values orders values by position, ignoring unused keys" do
+      assert Sql.map_query_values(
+               "SELECT @a, @b FROM t WHERE c = @c",
+               %{"a" => 1, "b" => 2, "c" => 3, "unused" => 9}
+             ) == [1, 2, 3]
+    end
+
+    test "map_query_values maps missing params to nil" do
+      assert Sql.map_query_values("SELECT @a, @b", %{"a" => 1}) == [1, nil]
+    end
+
+    test "map_query_values respects the dialect option for dialect-specific syntax" do
+      assert Sql.map_query_values(
+               "SELECT * EXCLUDE (secret) FROM t WHERE a = @a",
+               %{"a" => 1},
+               dialect: "duckdb"
+             ) == [1]
+    end
+
+    test "to_positional_parameters numbers repeated and prefix-overlapping params by position" do
+      assert Sql.to_positional_parameters("SELECT @a, @a_b FROM t WHERE c = @a") ==
+               "SELECT $1, $2 FROM t WHERE c = $3"
+
+      assert Sql.to_positional_parameters("SELECT @a_b, @a FROM t") == "SELECT $1, $2 FROM t"
+    end
+
     test "sandboxed queries work with simple CTEs" do
       user = insert(:user)
       source = insert(:source, user: user, name: "my_ch_table")
@@ -853,6 +881,90 @@ defmodule Logflare.SqlTest do
 
       assert {:error, err} = Sql.transform(:ch_sql, {cte_query, consumer_query}, user)
       assert String.downcase(err) =~ "restricted setting allow_introspection_functions"
+    end
+  end
+
+  describe "duckdb dialect" do
+    setup do
+      user = insert(:user)
+      source = insert(:source, user: user, name: "my_otel_source")
+      insert(:backend, type: :s3_tables, user: user, sources: [source])
+
+      %{user: user, source: source}
+    end
+
+    test "source reference becomes a source_uuid filtered subquery over otel_logs", %{
+      user: user,
+      source: source
+    } do
+      assert {:ok, transformed} =
+               Sql.transform(:duckdb_sql, "select id from my_otel_source", user)
+
+      assert transformed ==
+               ~s|SELECT id FROM (SELECT * FROM otel_logs WHERE source_uuid = '#{source.token}') AS "my_otel_source"|
+    end
+
+    test "an explicit table alias is preserved on the subquery", %{user: user, source: source} do
+      assert {:ok, transformed} =
+               Sql.transform(
+                 :duckdb_sql,
+                 "select t.id from my_otel_source t join my_otel_source o on o.id = t.id",
+                 user
+               )
+
+      assert transformed =~
+               ~s|FROM (SELECT * FROM otel_logs WHERE source_uuid = '#{source.token}') AS t|
+
+      assert transformed =~
+               ~s|JOIN (SELECT * FROM otel_logs WHERE source_uuid = '#{source.token}') AS o|
+    end
+
+    test "consolidated otel tables can be referenced directly", %{user: user} do
+      for table <- ~w(otel_logs otel_metrics otel_traces) do
+        assert {:ok, transformed} = Sql.transform(:duckdb_sql, "select id from #{table}", user)
+        assert transformed == "SELECT id FROM #{table}"
+      end
+    end
+
+    test "dotted OTEL column names are preserved", %{user: user} do
+      assert {:ok, transformed} =
+               Sql.transform(:duckdb_sql, ~s|select "events.timestamp" from otel_traces|, user)
+
+      assert transformed == ~s|SELECT "events.timestamp" FROM otel_traces|
+    end
+
+    test "unknown table is rejected", %{user: user} do
+      assert {:error, "can't find source not_a_source"} =
+               Sql.transform(:duckdb_sql, "select id from not_a_source", user)
+    end
+
+    test "rejects restricted functions", %{user: user} do
+      restricted_queries = [
+        {"read_csv", "select col1 from read_csv('/etc/passwd')"},
+        {"read_parquet", "select col1 from read_parquet('s3://bucket/f.parquet')"},
+        {"parquet_scan", "select col1 from parquet_scan('s3://bucket/f.parquet')"},
+        {"glob", "select col1 from glob('/etc/*')"},
+        {"duckdb_secrets", "select name from duckdb_secrets()"},
+        {"duckdb_settings", "select name from duckdb_settings()"},
+        {"getenv", "select getenv('AWS_SECRET_ACCESS_KEY')"}
+      ]
+
+      for {function_name, query} <- restricted_queries do
+        assert {:error, err} = Sql.transform(:duckdb_sql, query, user)
+        assert String.downcase(err) =~ "restricted function #{function_name}"
+      end
+    end
+
+    test "sandboxed queries are supported", %{user: user, source: source} do
+      cte_query = "with src as (select id from my_otel_source) select id from src"
+      consumer_query = "select id from src where id > 5"
+
+      assert {:ok, transformed} = Sql.transform(:duckdb_sql, {cte_query, consumer_query}, user)
+
+      assert transformed =~
+               ~s|WITH src AS (SELECT id FROM (SELECT * FROM otel_logs WHERE source_uuid = '#{source.token}')|
+
+      assert transformed =~ "SELECT id FROM src WHERE id > 5"
     end
   end
 
