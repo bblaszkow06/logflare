@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use arrow_array::RecordBatch;
 use arrow_json::ReaderBuilder;
+use arrow_select::concat::concat_batches;
 use iceberg::arrow::{schema_to_arrow_schema, RecordBatchPartitionSplitter};
-use iceberg::spec::{DataFileFormat, Transform, UnboundPartitionSpec};
+use iceberg::spec::DataFileFormat;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -24,8 +26,11 @@ use rustler::{Atom as NifAtom, Encoder, Env, NifMap, Resource, ResourceArc, Term
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
+mod layout;
 mod schema;
+mod sort;
 
+use layout::LayoutSpec;
 use schema::FieldSpec;
 
 mod atoms {
@@ -47,8 +52,6 @@ const APPEND_TIMEOUT: Duration = Duration::from_secs(55);
 /// Rows buffered per decoded `RecordBatch` before it is streamed into the
 /// parquet writer; bounds decoder memory independently of payload size.
 const DECODER_BATCH_SIZE: usize = 8192;
-
-const TIMESTAMP_PARTITION_NAME: &str = "timestamp_day";
 
 /// Handle to a constructed S3 Tables catalog client, held across NIF calls.
 pub struct CatalogResource {
@@ -169,10 +172,11 @@ fn init_catalog<'a>(env: Env<'a>, result_tag: Term<'a>, config: Config) -> NifAt
     })
 }
 
-/// Creates the Iceberg table for `table_name` from the given field list if it doesn't already
-/// exist, stamping `properties` (e.g. `logflare.schema-version`) into the table metadata.
-/// Idempotent: returns `{:ok, :already_exists}` both when the table was already present
-/// and when AWS reports a conflict from a concurrent create.
+/// Creates the Iceberg table for `table_name` from the given field list and layout
+/// (partition spec + sort order) if it doesn't already exist, stamping `properties`
+/// (e.g. `logflare.schema-version`) into the table metadata. Idempotent: returns
+/// `{:ok, :already_exists}` both when the table was already present and when AWS
+/// reports a conflict from a concurrent create.
 #[rustler::nif]
 fn ensure_table<'a>(
     env: Env<'a>,
@@ -180,6 +184,7 @@ fn ensure_table<'a>(
     catalog: ResourceArc<CatalogResource>,
     table_name: String,
     fields: Vec<FieldSpec>,
+    layout: LayoutSpec,
     properties: HashMap<String, String>,
 ) -> NifAtom {
     spawn_reply(env, result_tag, async move {
@@ -191,17 +196,15 @@ fn ensure_table<'a>(
             Err(err) => return Err(fmt_err(err)),
         }
 
-        let (table_schema, timestamp_field_id) = schema::build(&fields)?;
-
-        let partition_spec = UnboundPartitionSpec::builder()
-            .add_partition_field(timestamp_field_id, TIMESTAMP_PARTITION_NAME, Transform::Day)
-            .map_err(fmt_err)?
-            .build();
+        let (table_schema, field_ids) = schema::build(&fields)?;
+        let partition_spec = layout.partition_spec(&field_ids)?;
+        let sort_order = layout.sort_order(&field_ids, &table_schema)?;
 
         let creation = TableCreation::builder()
             .name(table_name)
             .schema(table_schema)
             .partition_spec(partition_spec)
+            .sort_order(sort_order)
             .properties(properties)
             .build();
 
@@ -230,11 +233,15 @@ fn ensure_table<'a>(
 #[derive(NifMap)]
 struct TableInfo {
     columns: Vec<String>,
+    partition: Vec<String>,
+    sort_order: Vec<String>,
     properties: HashMap<String, String>,
 }
 
-/// Returns the current column names and table properties of an existing
+/// Returns the current column names, layout and table properties of an existing
 /// Iceberg table, used to confirm table creation and detect schema drift.
+/// `partition` holds the partition field names, `sort_order` the source column
+/// names of the default sort order, in sort precedence.
 #[rustler::nif]
 fn table_info<'a>(
     env: Env<'a>,
@@ -252,17 +259,40 @@ fn table_info<'a>(
             .map_err(fmt_err)?;
 
         let metadata = table.metadata();
+        let schema = metadata.current_schema();
 
-        let columns = metadata
-            .current_schema()
+        let columns = schema
             .as_struct()
             .fields()
             .iter()
             .map(|field| field.name.clone())
             .collect::<Vec<String>>();
 
+        let partition = metadata
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<String>>();
+
+        // a sort field names its source column by id; an id the current schema
+        // dropped is surfaced as-is rather than silently skipped
+        let sort_order = metadata
+            .default_sort_order()
+            .fields
+            .iter()
+            .map(|field| {
+                schema
+                    .name_by_field_id(field.source_id)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("field-{}", field.source_id))
+            })
+            .collect::<Vec<String>>();
+
         Ok::<_, String>(TableInfo {
             columns,
+            partition,
+            sort_order,
             properties: metadata.properties().clone(),
         })
     })
@@ -323,12 +353,17 @@ impl Encoder for AppendError {
     }
 }
 
-/// Decodes newline-delimited JSON rows into Arrow record batches and streams
+/// Decodes newline-delimited JSON rows into Arrow record batches and writes
 /// them into one Iceberg parquet data file per day partition (callers batch
 /// per day, so normally exactly one), then commits a fast-append
 /// transaction. Commit conflicts are retried by the iceberg crate itself
 /// (bounded by the `commit.retry.*` table properties); exhaustion surfaces
 /// as `{:error, :commit_conflict}`.
+///
+/// Row order: rows are reordered to the table's declared sort order before
+/// being written, and the files advertise that order in their parquet footer,
+/// so a reader can prune on the leading sort columns. Tables created without
+/// a sort order keep arrival order.
 ///
 /// Contract: integer values in `timestamptz` columns are unix
 /// **microseconds** (the unit the mapper emits for NDJSON output and that
@@ -369,8 +404,22 @@ async fn do_append(
         table.metadata().default_partition_spec().clone(),
     )?;
 
-    let parquet_builder = ParquetWriterBuilder::new(WriterProperties::default(), iceberg_schema);
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let sort_fields = sort::resolve(
+        table.metadata().default_sort_order(),
+        &iceberg_schema,
+        &arrow_schema,
+    )
+    .map_err(AppendError::Other)?;
+
+    let writer_properties = match sort_fields.as_slice() {
+        [] => WriterProperties::default(),
+        fields => WriterProperties::builder()
+            .set_sorting_columns(Some(sort::sorting_columns(fields)))
+            .build(),
+    };
+
+    let parquet_builder = ParquetWriterBuilder::new(writer_properties, iceberg_schema);
+    let location_generator = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(
         "part".to_string(),
         Some(Uuid::new_v4().to_string()),
@@ -387,22 +436,18 @@ async fn do_append(
     // so successive batches of the same partition stream into the same file
     let mut writer = FanoutWriter::new(DataFileWriterBuilder::new(rolling_builder));
 
-    let mut decoder = ReaderBuilder::new(arrow_schema)
+    let mut decoder = ReaderBuilder::new(arrow_schema.clone())
         .with_batch_size(DECODER_BATCH_SIZE)
         .build_decoder()?;
 
-    let mut row_count: u64 = 0;
+    let mut decoded: Vec<RecordBatch> = Vec::new();
     let mut pos = 0;
 
     loop {
         // decode stops once a full batch is buffered, so drain before
         // decoding further
         while let Some(batch) = decoder.flush()? {
-            row_count += batch.num_rows() as u64;
-
-            for (partition_key, partition_batch) in splitter.split(&batch)? {
-                writer.write(partition_key, partition_batch).await?;
-            }
+            decoded.push(batch);
         }
 
         if pos >= ndjson.len() {
@@ -416,6 +461,26 @@ async fn do_append(
         }
 
         pos += read;
+    }
+
+    // sorting is global over the append, so the whole payload has to be
+    // materialised first; callers cap a batch at BatchSplitter's limits
+    let batches = match sort_fields.as_slice() {
+        [] => decoded,
+        fields => vec![sort::sort_batch(
+            &concat_batches(&arrow_schema, &decoded)?,
+            fields,
+        )?],
+    };
+
+    let mut row_count: u64 = 0;
+
+    for batch in &batches {
+        row_count += batch.num_rows() as u64;
+
+        for (partition_key, partition_batch) in splitter.split(batch)? {
+            writer.write(partition_key, partition_batch).await?;
+        }
     }
 
     if row_count == 0 {
