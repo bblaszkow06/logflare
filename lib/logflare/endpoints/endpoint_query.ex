@@ -58,7 +58,12 @@ defmodule Logflare.Endpoints.EndpointQuery do
     field(:name, :string)
     field(:query, :string)
     field(:description, :string)
-    field(:language, Ecto.Enum, values: [:bq_sql, :ch_sql, :lql, :pg_sql], default: :bq_sql)
+
+    field(:language, Ecto.Enum,
+      values: [:bq_sql, :ch_sql, :duckdb_sql, :lql, :pg_sql],
+      default: :bq_sql
+    )
+
     field(:source_mapping, :map)
     field(:sandboxable, :boolean)
     field(:cache_duration_seconds, :integer, default: 3_600)
@@ -220,9 +225,10 @@ defmodule Logflare.Endpoints.EndpointQuery do
   def update_source_mapping(changeset), do: changeset
 
   @spec map_backend_to_language(Backend.t() | nil, supabase_mode :: boolean()) ::
-          :bq_sql | :ch_sql | :pg_sql
+          :bq_sql | :ch_sql | :duckdb_sql | :pg_sql
   def map_backend_to_language(%Backend{type: :clickhouse}, _supabase_mode), do: :ch_sql
   def map_backend_to_language(%Backend{type: :postgres}, false), do: :pg_sql
+  def map_backend_to_language(%Backend{type: :s3_tables}, _supabase_mode), do: :duckdb_sql
   def map_backend_to_language(_backend, _supabase_mode), do: :bq_sql
 
   @spec infer_language_from_backend(%Changeset{}) :: %Changeset{}

@@ -19,9 +19,9 @@ defmodule Logflare.Sql do
   alias Logflare.Sql.Parser
   alias Logflare.User
 
-  @valid_query_languages ~w(bq_sql ch_sql pg_sql)a
+  @valid_query_languages ~w(bq_sql ch_sql duckdb_sql pg_sql)a
 
-  @typep query_language :: :bq_sql | :ch_sql | :pg_sql
+  @typep query_language :: :bq_sql | :ch_sql | :duckdb_sql | :pg_sql
 
   @bq_restricted_functions [
     "external_query",
@@ -76,6 +76,31 @@ defmodule Logflare.Sql do
     table_to_xmlschema
     version
   )
+
+  # DuckDB sessions hold the backend's S3 credentials, so anything that reads
+  # arbitrary files/URLs or inspects the session (secrets, settings) is blocked.
+  # `duckdb_*`, `pragma_*` and `read_*` functions are blocked by prefix.
+  @duckdb_restricted_functions [
+    "current_setting",
+    "delta_scan",
+    "gethostname",
+    "getenv",
+    "glob",
+    "iceberg_metadata",
+    "iceberg_scan",
+    "iceberg_snapshots",
+    "mysql_query",
+    "parquet_file_metadata",
+    "parquet_metadata",
+    "parquet_scan",
+    "parquet_schema",
+    "postgres_query",
+    "postgres_scan",
+    "sniff_csv",
+    "sqlite_scan",
+    "version",
+    "which_secret"
+  ]
 
   @ch_restricted_functions [
     "azureblobstorage",
@@ -178,6 +203,9 @@ defmodule Logflare.Sql do
       iex> Logflare.Sql.to_dialect(:ch_sql)
       "clickhouse"
 
+      iex> Logflare.Sql.to_dialect(:duckdb_sql)
+      "duckdb"
+
       iex> Logflare.Sql.to_dialect(:pg_sql)
       "postgres"
   """
@@ -215,7 +243,8 @@ defmodule Logflare.Sql do
 
   @doc """
   Transforms and validates a SQL query for the specified dialect,
-  which can be BigQuery (`:bq_sql`), ClickHouse (`:ch_sql`), or PostgreSQL (`:pg_sql`).
+  which can be BigQuery (`:bq_sql`), ClickHouse (`:ch_sql`), DuckDB (`:duckdb_sql`),
+  or PostgreSQL (`:pg_sql`).
 
   The query is parsed, validated, and transformed to include fully-qualified table names
   appropriate for the target backend.
@@ -231,7 +260,7 @@ defmodule Logflare.Sql do
 
   ## Sandboxed Queries
 
-  BigQuery and ClickHouse support sandboxed queries via tuple input `{cte_query, consumer_query}`.
+  BigQuery, ClickHouse and DuckDB support sandboxed queries via tuple input `{cte_query, consumer_query}`.
   This allows secure, parameterized endpoints where consumers can provide custom SQL while
   being restricted to pre-defined data subsets via CTEs.
 
@@ -306,6 +335,43 @@ defmodule Logflare.Sql do
     end
   end
 
+  # duckdb (S3 Tables) with sandboxed query support
+  # TODO: Extract common parts, repeated between languages
+  def transform(:duckdb_sql = language, input, %User{} = user) do
+    {query, sandboxed_query} =
+      case input do
+        q when is_non_empty_binary(q) -> {q, nil}
+        other when is_tuple(other) -> other
+      end
+
+    sql_dialect = to_dialect(language)
+    sources = Sources.list_sources_by_user(user)
+    source_mapping = source_mapping(sources)
+
+    Logger.metadata(query_string: query, user_id: user.id)
+
+    with {:ok, statements} <- Parser.parse(sql_dialect, query),
+         {:ok, sandboxed_query_ast} <- sandboxed_ast(sandboxed_query, sql_dialect),
+         base_data = %{
+           sources: sources,
+           source_mapping: source_mapping,
+           source_names: Map.keys(source_mapping),
+           sandboxed_query: sandboxed_query,
+           sandboxed_query_ast: sandboxed_query_ast,
+           ast: statements,
+           dialect: sql_dialect,
+           user_project_id: nil,
+           logflare_project_id: nil
+         },
+         data = DialectTransformer.DuckDb.build_transformation_data(user, base_data),
+         :ok <- validate_query(statements, data),
+         :ok <- maybe_validate_sandboxed_query_ast({statements, sandboxed_query_ast}, data) do
+      statements
+      |> do_transform(data)
+      |> Parser.to_string()
+    end
+  end
+
   # postgres (no sandboxed query support)
   def transform(:pg_sql = language, query, %User{} = user) do
     sql_dialect = to_dialect(language)
@@ -368,7 +434,8 @@ defmodule Logflare.Sql do
   end
 
   # Handle nil user case (e.g., during form validation)
-  def transform(language, query, nil) when language in [:ch_sql, :pg_sql, :bq_sql, nil] do
+  def transform(language, query, nil)
+      when language in [:ch_sql, :duckdb_sql, :pg_sql, :bq_sql, nil] do
     {:ok, query}
   end
 
@@ -392,8 +459,8 @@ defmodule Logflare.Sql do
 
   ### Example
 
-    iex> sources("select a from my_table", %User{...})
-    {:ok, %{"my_table" => "abced-weqqwe-..."}}
+    sources("select a from my_table", %User{...})
+    # => {:ok, %{"my_table" => "abced-weqqwe-..."}}
   """
   @spec sources(query :: String.t(), user :: User.t(), opts :: Keyword.t()) ::
           {:ok, %{String.t() => String.t()}} | {:error, String.t()}
@@ -472,14 +539,56 @@ defmodule Logflare.Sql do
   Returns parameter positions mapped to their names.
 
   ### Example
-  iex> parameter_positions("select @test as testing")
-  %{1 => "test"}
+
+    iex> parameter_positions("select @test as testing")
+    {:ok, %{1 => "test"}}
   """
   @spec parameter_positions(query :: String.t(), opts :: Keyword.t()) ::
           {:ok, %{integer() => String.t()}}
   def parameter_positions(query, opts \\ []) when is_non_empty_binary(query) and is_list(opts) do
     {:ok, parameters} = parameters(query, opts)
     {:ok, do_parameter_positions_mapping(query, parameters)}
+  end
+
+  @doc """
+  Orders `input_params` values to match the `$1..$n` placeholders emitted for a
+  query's `@param` references, by position. Missing params map to `nil`.
+
+  ### Example
+
+    iex> map_query_values("select @a, @b, @c", %{"a" => 1, "c" => 3})
+    [1, nil, 3]
+  """
+  @spec map_query_values(query :: String.t(), input_params :: map(), opts :: Keyword.t()) ::
+          [term()]
+  def map_query_values(query, input_params, opts \\ [])
+      when is_non_empty_binary(query) and is_map(input_params) and is_list(opts) do
+    {:ok, positions} = parameter_positions(query, opts)
+
+    positions
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map(fn {_position, parameter} -> Map.get(input_params, parameter) end)
+  end
+
+  @doc """
+  Rewrites `@param` references into the `$1..$n` positional placeholders that
+  backends bind values to, in the order returned by `map_query_values/2`.
+
+  ### Example
+
+    iex> to_positional_parameters("select @a, @b where c = @a")
+    "select $1, $2 where c = $3"
+  """
+  @spec to_positional_parameters(query :: String.t(), opts :: Keyword.t()) :: String.t()
+  def to_positional_parameters(query, opts \\ [])
+      when is_non_empty_binary(query) and is_list(opts) do
+    {:ok, positions} = parameter_positions(query, opts)
+
+    positions
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.reduce(query, fn {index, parameter}, acc ->
+      String.replace(acc, "@#{parameter}", "$#{index}", global: false)
+    end)
   end
 
   @doc """
@@ -525,8 +634,8 @@ defmodule Logflare.Sql do
 
   ### Example
 
-  iex> source_mapping("select a from old_table_name", %{"old_table_name"=> "abcde-fg123-..."}, %User{})
-  {:ok, "select a from new_table_name"}
+      source_mapping("select a from old_table_name", %{"old_table_name"=> "abcde-fg123-..."}, %User{})
+      # => {:ok, "select a from new_table_name"}
   """
   @spec source_mapping(
           query :: String.t(),
@@ -616,7 +725,7 @@ defmodule Logflare.Sql do
   end
 
   defp maybe_check_restricted_functions(ast, dialect, data)
-       when dialect in ~w(bigquery clickhouse postgres),
+       when dialect in ~w(bigquery clickhouse duckdb postgres),
        do: has_restricted_functions(ast, data)
 
   defp maybe_check_restricted_functions(_ast, _dialect, _data), do: :ok
@@ -646,6 +755,7 @@ defmodule Logflare.Sql do
          user_project_id: user_project_id,
          logflare_project_id: logflare_project_id,
          sandboxed_query_ast: sandboxed_query_ast,
+         dialect: dialect,
          ast: ast
        })
        when is_list(name) do
@@ -668,6 +778,9 @@ defmodule Logflare.Sql do
           true
 
         name in source_names ->
+          true
+
+        name in reserved_table_names(dialect) ->
           true
 
         SingleTenant.single_tenant?() and
@@ -705,6 +818,11 @@ defmodule Logflare.Sql do
   end
 
   defp check_all_sources_allowed(_kv, acc, _data), do: acc
+
+  # Dialect-owned tables that may be referenced alongside the user's sources.
+  @spec reserved_table_names(String.t()) :: [String.t()]
+  defp reserved_table_names("duckdb"), do: DialectTransformer.DuckDb.reserved_table_names()
+  defp reserved_table_names(_dialect), do: []
 
   defp check_single_query_only([_stmt]), do: :ok
 
@@ -802,6 +920,16 @@ defmodule Logflare.Sql do
       String.starts_with?(name, "dblink") -> true
       name in @pg_other_restricted_functions -> true
       String.starts_with?(name, "has_") -> true
+      true -> false
+    end
+  end
+
+  defp function_restricted?(name, "duckdb") do
+    cond do
+      String.starts_with?(name, "duckdb_") -> true
+      String.starts_with?(name, "pragma_") -> true
+      String.starts_with?(name, "read_") -> true
+      name in @duckdb_restricted_functions -> true
       true -> false
     end
   end
@@ -929,11 +1057,24 @@ defmodule Logflare.Sql do
     AstUtils.transform_recursive(ast, data, &do_replace_names/2)
   end
 
+  defp do_replace_names({"relation" = k, %{"Table" => %{"name" => names}} = relation}, data) do
+    transformer = DialectTransformer.for_dialect(data.dialect)
+    qualified_name = qualified_name(names)
+
+    if qualified_name in data.source_names and
+         Code.ensure_loaded?(transformer) and
+         function_exported?(transformer, :transform_source_relation, 3) do
+      {k, transformer.transform_source_relation(relation, qualified_name, data)}
+    else
+      {:recurse, {k, relation}}
+    end
+  end
+
   defp do_replace_names({"Table" = k, %{"name" => names} = v}, data) do
     transformer = DialectTransformer.for_dialect(data.dialect)
     dialect_quote_style = transformer.quote_style()
 
-    qualified_name = Enum.map_join(names, ".", fn %{"value" => part} -> part end)
+    qualified_name = qualified_name(names)
 
     new_name_list =
       if qualified_name in data.source_names do
@@ -968,6 +1109,9 @@ defmodule Logflare.Sql do
   end
 
   defp do_replace_names(ast_node, _data), do: {:recurse, ast_node}
+
+  @spec qualified_name([map()]) :: String.t()
+  defp qualified_name(names), do: Enum.map_join(names, ".", fn %{"value" => part} -> part end)
 
   defp replace_sandboxed_query(ast, data) do
     AstUtils.transform_recursive(ast, data, &do_replace_sandboxed_query/2)
