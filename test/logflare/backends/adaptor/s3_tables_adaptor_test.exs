@@ -11,6 +11,7 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
   alias Logflare.Backends.Adaptor.S3TablesAdaptor.Native
   alias Logflare.Backends.Adaptor.S3TablesAdaptor.Pipeline
   alias Logflare.Mapper.OtelDefaults
+  alias Logflare.S3TablesMockServer
   alias Logflare.SystemMetrics.AllLogsLogged
 
   doctest S3TablesAdaptor
@@ -203,10 +204,75 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
     end
   end
 
+  describe "ingestion against a mock S3 Tables API" do
+    setup do
+      server = S3TablesMockServer.start()
+
+      insert(:plan)
+      user = insert(:user)
+      source = insert(:source, user: user)
+
+      backend =
+        insert(:backend,
+          type: :s3_tables,
+          sources: [source],
+          user: user,
+          config: %{
+            table_bucket_arn: "arn:aws:s3tables:us-east-1:000000000000:bucket/mock-bucket",
+            namespace: "mock_namespace",
+            access_key_id: "mock-key",
+            secret_access_key: "mock-secret",
+            batch_timeout: 100,
+            endpoint_url: server.endpoint,
+            s3_endpoint: server.endpoint
+          }
+        )
+
+      start_supervised!(AllLogsLogged)
+      start_supervised!({S3TablesAdaptor, backend})
+      start_supervised!({CatalogManager, backend})
+
+      [source: source, backend: backend, server: server]
+    end
+
+    test "log event", %{source: source, backend: backend, server: server} do
+      backend_id = backend.id
+
+      :telemetry_test.attach_event_handlers(self(), [
+        [:logflare, :backends, :s3_tables, :append]
+      ])
+
+      assert {:ok, _} = Backends.ingest_logs([%{"event_message" => "mock server test"}], source)
+
+      assert_receive {[:logflare, :backends, :s3_tables, :append], _ref,
+                      %{row_count: 1, data_files: 1},
+                      %{status: :ok, backend_id: ^backend_id, event_type: :log}},
+                     30_000
+
+      assert %{"otel_logs" => _, "otel_metrics" => _, "otel_traces" => _} =
+               S3TablesMockServer.tables(server)
+
+      assert {:ok, catalog} = CatalogManager.fetch_catalog(backend_id)
+      assert {:ok, snapshot} = Native.snapshot_info(catalog, "otel_logs")
+      assert snapshot.operation == "append"
+      assert snapshot.summary["added-records"] == "1"
+
+      assert Enum.any?(
+               S3TablesMockServer.object_keys(server),
+               &String.ends_with?(&1, ".parquet")
+             )
+    end
+  end
+
   defp decode_ndjson(ndjson) do
     ndjson
     |> String.split("\n", trim: true)
     |> Enum.map(&Jason.decode!/1)
+  end
+
+  defp integration_env!(var) do
+    System.get_env(var) ||
+      raise "the :integration suite runs against real AWS and requires #{var} to be set"
   end
 
   describe "Native module (integration)" do
@@ -216,18 +282,18 @@ defmodule Logflare.Backends.Adaptor.S3TablesAdaptorTest do
       assert err =~ "invalid"
     end
 
+    # This suite is an opt-in live smoke test against real AWS
+    # (`mix test --include integration`); day-to-day coverage of the append
+    # path runs against the local mock server instead. The target bucket and
+    # credentials come from the environment rather than test config so that
+    # per-developer AWS secrets never live in the repo.
     setup do
-      table_bucket_arn = System.fetch_env!("LOGFLARE_S3_TABLES_TEST_BUCKET_ARN")
-      namespace = System.fetch_env!("LOGFLARE_S3_TABLES_TEST_NAMESPACE")
-      access_key_id = System.fetch_env!("AWS_ACCESS_KEY_ID")
-      secret_access_key = System.fetch_env!("AWS_SECRET_ACCESS_KEY")
-
       config =
         %{
-          table_bucket_arn: table_bucket_arn,
-          namespace: namespace,
-          access_key_id: access_key_id,
-          secret_access_key: secret_access_key
+          table_bucket_arn: integration_env!("LOGFLARE_S3_TABLES_TEST_BUCKET_ARN"),
+          namespace: integration_env!("LOGFLARE_S3_TABLES_TEST_NAMESPACE"),
+          access_key_id: integration_env!("AWS_ACCESS_KEY_ID"),
+          secret_access_key: integration_env!("AWS_SECRET_ACCESS_KEY")
         }
 
       # drop the OTEL tables before an integration run so tables created by
